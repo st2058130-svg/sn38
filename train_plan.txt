@@ -1,0 +1,201 @@
+Below is a detailed step-by-step training path plan for your 2.2B parameter causal model with a hard knowledge cutoff at end of 2012. The plan prioritizes temporal purity over data volume, follows the methodology validated by the ChronoGPT/ChronoBERT work, and accounts for the fact that you already have the base architecture.
+
+Phase 0: Prerequisites and Infrastructure Setup
+Before touching data, establish the guardrails that will prevent leakage throughout the pipeline.
+
+Step 0.1 — Define the hard temporal boundary. Set CUTOFF = 2012-12-31T23:59:59Z. Every document, metadata field, and extracted publication date must be strictly before this timestamp. Any ambiguity means discard.
+
+Step 0.2 — Set up a leakage canary suite. Create 200–500 "known post-2012 facts" that a contaminated model would likely answer correctly. Examples: "Who won the 2016 US presidential election?", "What was the Brexit referendum result?", "Who is the CEO of Apple as of 2020?" Store these as prompts with expected post-2012 answers. After each training checkpoint, run inference on these prompts. If the model produces post-2012 answers at a rate significantly above chance, your data pipeline has leaked. This mirrors the ChronoGPT validation methodology, which used U.S. presidential predictions as a leakage detector .
+
+Step 0.3 — Prepare the tokenizer. Use the tokenizer associated with your base architecture. Do not change it mid-pipeline; tokenizer changes invalidate token counts and complicate debugging.
+
+Phase 1: Data Acquisition (Source-by-Source)
+You cannot download the ChronoGPT corpus directly. You must rebuild it from public sources following their documented methodology. The original work used a mix of peS2o, Wikipedia, and FineWeb for incremental pretraining, with Common Crawl introduced only from 2013 onward . Since your cutoff is 2012, you will not use Common Crawl post-2012, and you should be cautious about pre-2013 Common Crawl due to unreliable date attribution.
+
+Step 1.1 — Wikipedia 2012 Snapshot (Priority: Highest)
+What to get: The English Wikipedia dump closest to December 2012, plus revision history to reconstruct article states as of the cutoff.
+
+How to get it: Use the Wikimedia dumps archive. For a specific date, use the MediaWiki Action API with prop=revisions and rvstart set to your cutoff date to retrieve the revision active at that time . For bulk extraction, download the pages-meta-history dump and filter revisions by timestamp ≤ cutoff.
+
+Volume expectation: ~2–3B tokens after cleaning. This is your highest-confidence factual source.
+
+Critical step: Also extract redirects and deletion logs from the 2012 snapshot. Articles that existed in 2012 but were later deleted are legitimate 2012 knowledge.
+
+Step 1.2 — peS2o (Priority: High)
+What to get: The peS2o dataset (scientific papers) filtered to publication date ≤ 2012.
+
+How to get it: The ChronoGPT authors explicitly cite peS2o as a pretraining source . Access the dataset via its public release (typically available through Hugging Face or the Allen Institute). Filter by the publication_date or year metadata field. Do not rely on the dataset's internal date field alone; cross-check with the paper's own metadata where possible.
+
+Volume expectation: ~1–2B tokens after strict filtering. Discard any record with missing or ambiguous publication date.
+
+Step 1.3 — FineWeb-edu (Priority: Medium, with Strict Date Filtering)
+What to get: FineWeb-edu is a high-quality web crawl filtered by an educational-value classifier . The ChronoGPT authors used it for later incremental training . For your 2012 cutoff, you need only the portion of FineWeb that corresponds to web pages published before 2013.
+
+The problem: FineWeb itself does not guarantee reliable publication dates for every document. You must run a date-extraction pass on every document (see Phase 2). Expect to discard a large fraction.
+
+How to get it: Download FineWeb-edu shards, then apply your date-filtering pipeline. The original ChronoGPT work used a FineWeb-edu classifier score threshold of >2 to retain high-quality text. Apply the same threshold.
+
+Volume expectation: Highly variable. After aggressive date filtering, expect 5–15B tokens of usable pre-2013 web text. Do not chase volume here; purity matters more.
+
+Step 1.4 — Pre-2013 Books and Long-Form Text (Priority: Medium)
+What to get: Project Gutenberg (public domain, all pre-2013 by definition) and pre-2013 books from Internet Archive.
+
+How to get it: Gutenberg is directly downloadable. For Internet Archive, filter by publication_date metadata ≤ 2012. Apply OCR quality filtering (reject low-quality scans). A useful reference is the BART dataset's filtering approach: OCR score ≥ 90, language = English, date parsed and < threshold, tokenizability score ≥ 95 . Adapt these thresholds to your needs.
+
+Volume expectation: ~3–5B tokens.
+
+Step 1.5 — Usenet Corpus 1980–2013 (Priority: Optional, but Valuable for Temporal Diversity)
+What to get: The Usenet Corpus 1980–2013 contains 103B tokens of pre-LLM human discourse, with explicit timestamps for every post . This is an unusually clean temporal source because Usenet posts have reliable dates.
+
+How to get it: Available on Hugging Face (gated, academic access). Filter to date ≤ 2012-12-31. The comp.* and sci.* hierarchies are noted as cleaner signal than alt.* .
+
+Volume expectation: If you use the comp.* and sci.* hierarchies only (~13.6B tokens total before 2013 filtering), expect 10–12B tokens after cutoff filtering. This is a strong supplement to web data.
+
+Phase 2: Temporal Filtering Pipeline (The Most Critical Engineering Step)
+This is where leakage is either prevented or introduced. Implement a multi-signal date confidence system and apply a discard-on-doubt policy.
+
+Step 2.1 — Metadata Date Extraction
+For each document, extract dates in priority order:
+
+Explicit structured metadata: JSON-LD datePublished, OpenGraph article:published_time, HTML <time datetime> tags .
+
+URL patterns: Some sites embed dates in URLs (e.g., /2012/03/article-title). Parse these but treat as secondary evidence.
+
+WARC/HTTP headers: Crawl timestamps from Common Crawl or other archives. Note: crawl date is not publication date; a page crawled in 2012 may contain text written in 2013. Use crawl date only as an upper bound.
+
+Content-based extraction: Publication date mentions in the first few paragraphs (e.g., "Published: March 5, 2012"). Use regex + heuristics.
+
+Step 2.2 — Apply the Discard Rules
+Condition	Action
+Any extracted date > 2012-12-31	Discard entire document
+No date found and no reliable fallback	Discard
+Date found but conflicting signals (e.g., metadata says 2011, URL says 2013)	Discard
+Internal text mentions years > 2012 in factual context	Discard (strong leakage indicator)
+Usenet post with timestamp ≤ 2012	Keep (highest confidence)
+Wikipedia revision with timestamp ≤ 2012	Keep (highest confidence)
+Step 2.3 — Internal Year Scanning
+Run a regex pass over all retained documents for years 2013–2025. If a document contains references to events in these years (e.g., "In 2014, the company announced..."), discard it. This catches cases where metadata date is wrong or where content was retroactively updated.
+
+Caveat: Some pre-2012 documents may mention future years in speculative contexts (e.g., "By 2020, we expect..."). These are safe. Only discard when the reference is to a past-tense event after 2012. Implement a simple heuristic: if the year > 2012 appears near past-tense verbs ("was", "happened", "announced"), flag for discard.
+
+Phase 3: Data Cleaning and Quality Filtering
+Step 3.1 — Heuristic Cleaning
+Apply standard web-text cleaning:
+
+Remove HTML artifacts, boilerplate, navigation elements.
+
+Normalize whitespace.
+
+Remove documents with excessive special-character ratio or extreme length .
+
+Language identification: retain English only (or your target language).
+
+Step 3.2 — Quality Filtering
+For FineWeb-edu: Apply the FineWeb-edu classifier with threshold >2, as done in ChronoGPT .
+
+For Wikipedia: Apply minimum article-length and readability thresholds.
+
+For Usenet: Use the comp.* and sci.* hierarchies; alt.* is noisier .
+
+Step 3.3 — Deduplication
+Apply MinHash-LSH deduplication over word n-grams (typically 5-grams) to remove near-duplicates. Retain the earliest-dated representative of each duplicate cluster. This prevents the model from over-weighting repeated content and reduces wasted compute .
+
+Phase 4: Building the 2012-Weighted QA Dataset (For Validator Performance)
+Your validator weights 2012 facts 5× more than other years. You need explicit 2012-anchored data to satisfy this.
+
+Step 4.1 — Generate QA Pairs from the 2012 Wikipedia Snapshot
+From the reconstructed 2012 Wikipedia articles, generate:
+
+Cloze questions: "Who was the President of France in 2012?" → extract from 2012 article state.
+
+Factual statements: "In 2012, [entity] [event]." → verify against 2012 snapshot.
+
+Temporal comparisons: "What was true about X in 2012 that is no longer true?"
+
+Target: 500k–1M QA pairs, each tagged with year=2012, weight=5.0, and source=wikipedia_2012.
+
+Step 4.2 — Generate from Usenet 2012 Posts
+Extract contemporaneous discussions about 2012 events from Usenet posts dated 2012. Generate QA pairs where the answer is explicitly grounded in the post content. This adds conversational diversity to the 2012-weighted data.
+
+Step 4.3 — Validate QA Pairs Against Leakage
+For each QA pair, verify that the answer is true as of 2012 and does not require post-2012 knowledge. Reject any pair whose answer would be different today (e.g., "Who is the CEO of Apple?" → answer in 2012 is Tim Cook, but this is still true today; a better example is "Which country has the largest population?" → answer in 2012 is China, but today it is India. Reject the latter type or explicitly mark it as a temporal fact).
+
+Phase 5: Data Mixing and Training Configuration
+Step 5.1 — Token Budget for 2.2B Model
+Based on Chinchilla scaling (~20 tokens/parameter), the theoretical optimal is ~44B tokens. Given your strict temporal constraints, target 30–40B unique tokens with multiple epochs on the highest-quality subsets.
+
+Source	Tokens (unique)	Notes
+Wikipedia 2012 snapshot	2–3B	Highest confidence
+peS2o (pre-2013)	1–2B	Scientific reasoning
+FineWeb-edu (pre-2013, filtered)	10–15B	Bulk language modeling
+Books (Gutenberg + Archive)	3–5B	Long-form coherence
+Usenet (comp.* + sci.*, pre-2013)	10–12B	Temporal diversity
+2012 QA pairs	0.5–1B	Weight 5×
+Total unique	~27–38B	
+Step 5.2 — Implement the 5× Weighting
+Use two mechanisms simultaneously:
+
+Data upsampling: Duplicate the 2012 QA dataset 2–3× in the training mix.
+
+Loss weighting: Assign weight=5.0 to 2012-specific samples and weight=1.0 to all others. In your training loop, multiply the per-sample cross-entropy loss by its weight before backpropagation. Start with 2–3× loss weight + 2× upsampling and monitor for instability. If validation loss on 2012 facts decreases much slower than other years, increase toward 4×. Avoid jumping directly to 5× loss weight on a 2.2B model; it can destabilize training.
+
+Step 5.3 — Training Epochs
+Given the data-constrained regime, follow the Muennighoff et al. scaling insights cited by ChronoGPT: train over multiple epochs on high-quality data . For your highest-confidence sources (Wikipedia 2012, QA pairs), use 3–4 epochs. For web data (FineWeb, Usenet), use 1–2 epochs to avoid overfitting to noise.
+
+Phase 6: Training Loop and Checkpointing
+Step 6.1 — Training Configuration
+Architecture: Your existing 2.2B base model.
+
+Objective: Causal language modeling (CLM), next-token prediction.
+
+Context length: Match your architecture's supported context (ChronoGPT used 1,792 tokens; your base may differ).
+
+Optimizer: Use an efficient optimizer (e.g., AdamW with tuned betas, or a memory-efficient variant if your base architecture supports it). The ChronoGPT work used modded-nanoGPT optimizations for efficiency .
+
+Step 6.2 — Checkpointing Strategy
+Save checkpoints every 1–2B tokens. After each checkpoint:
+
+Run the leakage canary suite (Phase 0.2). If post-2012 facts are being answered correctly above chance, stop training and audit the data pipeline.
+
+Evaluate validation loss separately on 2012-weighted data vs. general pre-2012 data. The gap tells you whether the weighting is working.
+
+Step 6.3 — Monitoring for Temporal Degradation
+A known risk in chronological training is that the model may become "temporally confused" if post-2012 language patterns leak in through noisy web data. Watch for:
+
+The model producing anachronistic vocabulary (terms coined after 2012) in generated text.
+
+The leakage canary suite showing elevated post-2012 accuracy.
+
+Validation loss on 2012 QA pairs plateauing or increasing while general loss decreases.
+
+If any of these occur, tighten the date filter and consider dropping the FineWeb portion entirely, relying more on Wikipedia and Usenet.
+
+Phase 7: Final Validation Before Submission
+Step 7.1 — Internal Temporal Holdout
+Create a set of 5,000–10,000 facts that were true in 2012 but changed by 2020. Examples:
+
+"Who is the CEO of [company]?" (many changed)
+
+"Which country is the largest by population?" (changed)
+
+"What is the capital of [country]?" (some changed)
+
+If your model answers these with post-2012 facts, you have leakage. If it answers with 2012 facts, the temporal constraint is working.
+
+Step 7.2 — 2012 Fact Recall Test
+Create a separate set of 5,000 facts that are specifically about 2012 (events, people, statistics). Measure recall. This is what the validator's 5× weighting will test. If recall is low, revisit Phase 4 and increase the quantity and quality of 2012 QA pairs.
+
+Step 7.3 — Leakage Canary Final Check
+Run the Phase 0.2 suite one final time. The acceptable threshold is at or near chance on post-2012 facts. ChronoGPT's validation showed that none of the 26 model vintages correctly predicted a future first-term president, and post-cutoff event predictions were essentially at chance .
+
+Summary Checklist
+Phase	Action	Key Metric
+0	Leakage canary suite, cutoff defined	Canary baseline established
+1	Wikipedia 2012, peS2o pre-2013, FineWeb pre-2013, Books, Usenet	Source-specific token counts
+2	Multi-signal date filtering, discard-on-doubt	Zero documents with post-2012 dates
+3	Cleaning, quality filtering, MinHash dedup	Retained token count per source
+4	500k–1M 2012 QA pairs	QA count, leakage-validated
+5	Mix: 30–40B unique, 2× upsample + 2–3× loss weight on 2012	Effective 2012 token share
+6	Multi-epoch training, checkpoints every 1–2B tokens	Canary accuracy, 2012 vs. general val loss
+7	Temporal holdout, 2012 recall, final canary	Post-2012 answer rate ~chance
+The single most important discipline is Phase 2. If the date filtering is not ruthless, no amount of training or weighting will satisfy the validator. Build the filtering pipeline first, test it on a small sample of known-dated documents, and only proceed to full-scale data processing when the filter demonstrably removes all post-2012 content.

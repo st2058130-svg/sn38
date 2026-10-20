@@ -1,0 +1,22 @@
+__pycache__/
+.idea/
+.venv/
+.env
+.local/
+*.pyc
+uv.lock
+validator_cache.db
+models.json
+/phala.toml
+
+# Miner training path artifacts
+train/data/raw/
+train/data/filtered/
+train/data/filtered_edu/
+train/data/snapshots/
+train/data/qa/
+train/data/mix/
+train/checkpoints/
+train/export/
+*.safetensors
+

@@ -1,0 +1,64 @@
+### SN38 DATAGEN — RunPod 32 vCPU / 128 GB + network volume (≥500GB–1TB)
+# Wiki: Wikimedia enwiki pages-meta-history (NOT Ti-Ma)
+# Per shard: download → extract → filter → DELETE archive+raw
+# Save pre-mix corpus under snapshots/cutoff_2012/ for later 2011 re-filter
+# Then: FineWeb-edu classifier → QA → mix → (later) train
+
+# ========== 0) ON POD — once ==========
+cd /workspace
+git clone <YOUR_REPO_URL> sn38
+cd sn38
+bash scripts/runpod/setup.sh
+source /workspace/sn38-data/env.sh
+export HF_TOKEN=hf_xxx
+# export WIKI_DUMP_ID=20261001
+# export WIKI_DUMP_FORMAT=7z
+# bash scripts/runpod/run_datagen.sh wiki-list
+
+# ========== 1) START ALL SOURCES (parallel tmux) ==========
+bash scripts/runpod/run_full_scale.sh start
+# jobs: sn38-full-wiki | sn38-full-pes2o | sn38-full-fineweb | sn38-full-books
+
+# ========== 2) MONITOR until ALL DONE ==========
+bash scripts/runpod/run_full_scale.sh status
+tail -f /workspace/sn38-data/logs/full_*.log
+# Do NOT continue until wiki + pes2o + fineweb + books show DONE
+# ls -lh $SN38_DATA_ROOT/filtered/
+
+# ========== 3) SNAPSHOT date-filtered 2012 (BEFORE edu/mix) — keep for 2011 ==========
+bash scripts/runpod/run_full_scale.sh snapshot-filtered
+# → $SN38_DATA_ROOT/snapshots/cutoff_2012/filtered/*.jsonl
+
+# ========== 4) EDU CLASSIFIER + QA + MIX ==========
+# Prefer GPU for edu pass (CPU works, very slow)
+bash scripts/runpod/run_full_scale.sh mix
+# also snapshots filtered_edu at end:
+# → $SN38_DATA_ROOT/filtered_edu/
+# → $SN38_DATA_ROOT/mix/train_mix.jsonl
+# → $SN38_DATA_ROOT/snapshots/cutoff_2012/filtered_edu/*.jsonl
+
+# Manual split (optional):
+#   bash scripts/runpod/run_full_scale.sh edu
+#   bash scripts/runpod/run_full_scale.sh snapshot-edu
+#   python -m train.data.build_mix_all --skip-edu
+
+# ========== 5) FREEZE MIX ==========
+cp -a $SN38_DATA_ROOT/mix/train_mix.jsonl $SN38_DATA_ROOT/mix/train_mix_2012_v1.jsonl
+ls -lh $SN38_DATA_ROOT/snapshots/cutoff_2012/
+ls -lh $SN38_DATA_ROOT/mix/train_mix_2012_v1.jsonl
+
+# ========== 6) TRAIN later (H100) — NOT during datagen ==========
+# python -m train.train_clm \
+#   --mix $SN38_DATA_ROOT/mix/train_mix_2012_v1.jsonl \
+#   --arch nanochrono --init-new --tokenizer YOUR_32K_TOK \
+#   --run-canary
+
+# ========== LATER ROUND: 2011 model from 2012 snapshot ==========
+# python -m train.data.refilter_cutoff \
+#   --from-snapshot $SN38_DATA_ROOT/snapshots/cutoff_2012/filtered \
+#   --cutoff-year 2011 \
+#   --out-dir $SN38_DATA_ROOT/filtered
+# bash scripts/runpod/run_full_scale.sh edu
+# python -m train.data.build_mix_all --skip-edu
+# python -m train.data.snapshot_corpus --stage all --cutoff-year 2011
+# cp -a $SN38_DATA_ROOT/mix/train_mix.jsonl $SN38_DATA_ROOT/mix/train_mix_2011_v1.jsonl

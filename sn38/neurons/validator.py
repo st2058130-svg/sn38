@@ -1,0 +1,458 @@
+"""
+SN38 Validator — Two-stage evaluation
+
+Stage 1: Leak detection (all miners)
+Stage 2: Quality evaluation via elimination bracket (top N only)
+
+Winner takes all.
+
+Usage:
+    python -m sn38.neurons.validator --netuid 38
+"""
+
+import argparse
+import asyncio
+import hashlib
+import logging
+import os
+import time
+
+import numpy as np
+import torch
+import bittensor as bt
+
+logger = logging.getLogger(__name__)
+
+from ..template.model_loader import load_model
+from ..template.constants import NETWORKS
+from ..template.model_store import direct_download_model, delete_models, set_round_cache, parse_repo, get_repo_file_size, count_model_params, get_device, verify_commit_sha
+from ..template.backend_api import BackendAPI
+from ..template.validator_db import get_connection, get_cached_result, save_result, is_week_evaluated, mark_week_evaluated, cleanup_after_uid, get_unsynced_eval_details, mark_synced, get_quality_prompts, save_quality_prompts
+from ..template.dedup import check_against_saved, save_candidate, cleanup
+from ..template.leak import evaluate
+from ..template.quality import run_quality_duels
+from ..template.quality_prompts import generate_prompts
+from ..template.round_results import RoundResults
+
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+
+
+def _free_gpu():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+def _sync_eval_details(api, conn):
+    unsynced = get_unsynced_eval_details(conn)
+    if not unsynced:
+        return
+    logger.info(f"Syncing {len(unsynced)} eval details to backend...")
+    synced = 0
+    for row in unsynced:
+        if api.submit_eval_detail(row["round"], row["uid"], row["year"], row["repo_id"],
+                                  row["passed"], row["score"], row["score_unknown"], row["score_known"]):
+            mark_synced(conn, row["uid"], row["year"], row["repo_id"], row["round"])
+            synced += 1
+    logger.info(f"Sync complete: {synced}/{len(unsynced)}")
+
+
+def _get_current_weights(subtensor, netuid, wallet, owner_uid):
+    """Read current on-chain weights for this validator."""
+    metagraph = subtensor.metagraph(netuid=netuid, lite=False)
+    my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
+    current = metagraph.weights[my_uid]
+    nonzero = [(int(i), float(current[i])) for i in range(len(current)) if current[i] > 0]
+    if nonzero:
+        return [u for u, _ in nonzero], [w for _, w in nonzero]
+    return [owner_uid], [1.0]
+
+
+def _preload_benchmarks(api, all_years):
+    benchmarks = {}
+    for year in all_years:
+        benchmarks[year] = {
+            "unknown": api.get_benchmark(year),
+            "known": api.get_benchmark(year, known=True),
+        }
+    return benchmarks
+
+
+def check_duplicate_weights(api, model_path, uid, snapshot_at):
+    """Check if model weights were already submitted by another miner. Returns True if allowed."""
+    model_file = os.path.join(model_path, "model.safetensors")
+    if not os.path.exists(model_file):
+        model_file = os.path.join(model_path, "pytorch_model.bin")
+    weight_hash = hashlib.sha256(open(model_file, "rb").read()).hexdigest()
+    check = api.check_hash(weight_hash, uid, snapshot_at)
+    if not check["allowed"]:
+        logger.warning(f"UID {uid}: duplicate weights (owner: UID {check['owner_uid']}), skipping")
+        return False
+    return True
+
+
+WORST_SCORE = 0.0
+
+def fail_year(api, conn, uid, year, repo_str, eval_round):
+    save_result(conn, uid, year, repo_str, False, WORST_SCORE, 0.0, 0.0, eval_round)
+    if api.submit_eval_detail(eval_round, uid, year, repo_str, False, WORST_SCORE, 0.0, 0.0):
+        mark_synced(conn, uid, year, repo_str, eval_round)
+
+
+def prefetch_models(api, submissions, config, all_years, conn, eval_round):
+    """Download every submission up front. A model that cannot be fetched is failed now."""
+    ok = {}
+    total = len({r for models in submissions.values() for r in models.values() if r})
+    for uid, models in submissions.items():
+        for year in all_years:
+            repo_str = models.get(str(year))
+            if not repo_str:
+                continue
+            if get_cached_result(conn, uid, year, repo_str, eval_round) is not None:
+                logger.info(f"Prefetch: {repo_str} year {year} result cached")
+                continue
+            if repo_str not in ok:
+                repo_id, revision = parse_repo(repo_str)
+                try:
+                    if get_repo_file_size(repo_id, revision) > config["max_model_bytes"]:
+                        logger.warning(f"Prefetch: {repo_str} too large")
+                        ok[repo_str] = False
+                    else:
+                        logger.info(f"Prefetch {len(ok) + 1}/{total} ({(len(ok) + 1) / total:.0%}): {repo_str}")
+                        direct_download_model(repo_id, revision=revision)
+                        ok[repo_str] = True
+                except Exception as error:
+                    logger.warning(f"Prefetch: {repo_str} unavailable — {type(error).__name__}")
+                    ok[repo_str] = False
+            if ok[repo_str]:
+                continue
+            fail_year(api, conn, uid, year, repo_str, eval_round)
+    fetched = sum(ok.values())
+    logger.info(f"Prefetch: {fetched} fetched, {len(ok) - fetched} unavailable, {total - len(ok)} cached of {total}")
+
+
+def evict_unqualified(qualified, submissions):
+    """Drop cached models of miners that failed leak or did not make the cut."""
+    qualified_uids = {uid for uid, _ in qualified}
+    keep, drop = set(), set()
+    for uid, models in submissions.items():
+        for repo_str in models.values():
+            _, revision = parse_repo(repo_str)
+            if revision:
+                (keep if uid in qualified_uids else drop).add(revision)
+    delete_models(drop - keep)
+
+
+def run_stage1(api, submissions, submission_times, config, all_years, conn, benchmarks, eval_round):
+    """Evaluate all miners for leak detection. Returns {uid: score}."""
+    leak_scores = {}
+
+    device = get_device()
+
+    dedup_probes = api.get_dedup_probes(eval_round)
+    logger.info("Loaded dedup probes")
+
+    sorted_uids = sorted(submissions.keys(), key=lambda u: submission_times.get(u, "9999"))
+    total = len(sorted_uids)
+    for i, uid in enumerate(sorted_uids):
+        models = submissions[uid]
+        logger.info(f"UID {uid}: {len(models)} years submitted")
+
+        repo_to_years = {}
+        year_scores = {year: WORST_SCORE for year in all_years}
+
+        cached_count = 0
+        for year in all_years:
+            repo_id = models.get(str(year))
+            if not repo_id:
+                continue
+            cached = get_cached_result(conn, uid, year, repo_id, eval_round)
+            if cached is not None:
+                _, score = cached
+                year_scores[year] = score
+                cached_count += 1
+                continue
+            repo_to_years.setdefault(repo_id, []).append(year)
+
+        if cached_count > 0:
+            logger.info(f"UID {uid}: {cached_count} scores loaded from cache")
+
+        for repo_str, years in repo_to_years.items():
+            repo_id, revision = parse_repo(repo_str)
+            file_size = get_repo_file_size(repo_id, revision)
+            if file_size > config["max_model_bytes"]:
+                logger.warning(f"UID {uid}: {repo_str} too large, skipping")
+                continue
+
+            def fail_repo_years():
+                for y in years:
+                    fail_year(api, conn, uid, y, repo_str, eval_round)
+
+            try:
+                logger.info(f"UID {uid}: downloading {repo_id}...")
+                path = direct_download_model(repo_id, revision=revision)
+
+                if not verify_commit_sha(repo_id, revision):
+                    logger.warning(f"UID {uid}: revision {revision} is not a real commit SHA, skipping")
+                    fail_repo_years()
+                    continue
+
+                if not check_duplicate_weights(api, path, uid, submission_times.get(uid, "")):
+                    fail_repo_years()
+                    continue
+
+                model, tokenizer = load_model(path, device)
+                param_count = count_model_params(model)
+                logger.info(f"UID {uid}: loaded {param_count / 1e6:.0f}M params")
+
+                if param_count > config["max_parameters"]:
+                    logger.warning(f"UID {uid}: {param_count / 1e9:.1f}B > limit, skipping")
+                    del model
+                    _free_gpu()
+                    fail_repo_years()
+                    continue
+
+                state = model.inner_state_dict()
+
+                passed_dedup, matched_uid, reason, logits = check_against_saved(model, state, device, dedup_probes)
+                if not passed_dedup:
+                    logger.warning(f"UID {uid}: duplicate of UID {matched_uid} ({reason}), skipping")
+                    del state, logits, model
+                    _free_gpu()
+                    fail_repo_years()
+                    continue
+
+                save_candidate(state, uid, logits)
+                del state, logits
+
+                eval_start = time.time()
+                any_passed = False
+                for year in years:
+                    if time.time() - eval_start > config["max_eval_seconds"]:
+                        logger.warning(f"UID {uid}: timeout, remaining years skipped")
+                        break
+
+                    bench = benchmarks[year]
+                    logger.info(f"UID {uid}: evaluating year {year}...")
+                    failed_leak, median_unknown = evaluate(model, device, bench["unknown"])
+                    passed_known, median_known = evaluate(model, device, bench["known"])
+                    passed = not failed_leak and passed_known
+
+                    if not passed:
+                        score = WORST_SCORE
+                    else:
+                        score = median_unknown - median_known
+                        any_passed = True
+                    year_scores[year] = score
+                    save_result(conn, uid, year, repo_str, passed, score, median_unknown, median_known, eval_round)
+                    if api.submit_eval_detail(eval_round, uid, year, repo_str, passed, score, median_unknown, median_known):
+                        mark_synced(conn, uid, year, repo_str, eval_round)
+                    logger.info(f"UID {uid}: year {year} {'PASSED' if passed else 'FAILED'}")
+                    logger.debug(f"UID {uid} year {year}: unknown={median_unknown:.4f} known={median_known:.4f} score={score:.4f}")
+
+                elapsed = time.time() - eval_start
+                logger.info(f"UID {uid}: done in {elapsed:.0f}s")
+                del model
+                _free_gpu()
+                if not any_passed:
+                    delete_models([revision])
+
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.error(f"UID {uid}: {repo_id} FAILED — {type(e).__name__}")
+                fail_repo_years()
+
+        leak_scores[uid] = sum(year_scores.values()) / len(all_years)
+        logger.debug(f"UID {uid}: leak_score={leak_scores[uid]:.4f}")
+        logger.info(f"Stage 1 progress: {i + 1}/{total} ({(i + 1) / total:.0%})")
+
+    _sync_eval_details(api, conn)
+    return leak_scores
+
+
+def qualify(leak_scores, config):
+    """Filter and normalize miners for Stage 2. Returns (qualified, normalized_leak)."""
+    top_n = config.get("top_n_for_quality", 10)
+    min_eval_score = config.get("min_eval_score", -3.0)
+    ranked = sorted(leak_scores.items(), key=lambda x: x[1])
+    qualified = [(uid, score) for uid, score in ranked if score < min_eval_score][:top_n]
+
+    logger.info(f"Qualified: {len(qualified)} miners — UIDs: {[uid for uid, _ in qualified]}")
+
+    # Normalisation window, independent of the pass/fail gate above: moving it
+    # changes how leak is scored, never who qualifies.
+    leak_floor = config.get("leak_floor", -11.0)
+    leak_ceiling = config.get("leak_ceiling", -25.0)
+    normalized_leak = {uid: max(0.0, min(1.0, (leak_floor - score) / (leak_floor - leak_ceiling))) for uid, score in qualified}
+
+    return qualified, normalized_leak
+
+
+def run_stage2_and_score(api, leak_scores, submissions, submission_times, config, all_years, metagraph, conn=None):
+    """Run qualification, quality duels, and compute final scores."""
+    qualified, normalized_leak = qualify(leak_scores, config)
+    evict_unqualified(qualified, submissions)
+    owner_uid = config.get("owner_uid", 0)
+    if not qualified:
+        results = RoundResults.no_qualified(leak_scores, owner_uid)
+        return np.zeros(metagraph.n), None, None, None, results
+
+    win_rates = None
+    if len(qualified) == 1:
+        logger.info("Only 1 miner qualified, skipping stage 2")
+        final_scores = np.zeros(metagraph.n)
+        final_scores[qualified[0][0]] = 1.0
+    else:
+        logger.info("=== Stage 2: Quality evaluation ===")
+        eval_round = config.get("eval_round", 0)
+        prompts = None
+        if conn:
+            prompts = get_quality_prompts(conn, eval_round)
+            if prompts:
+                logger.info(f"Loaded {len(prompts)} cached quality prompts")
+        if not prompts:
+            prompts = generate_prompts(eval_round)
+            if conn and prompts:
+                save_quality_prompts(conn, eval_round, prompts)
+        if not prompts:
+            raise RuntimeError("Failed to generate quality prompts")
+        else:
+            win_rates = asyncio.run(run_quality_duels(qualified, submissions, prompts, metagraph, all_years, eval_round, conn))
+            leak_weight = config.get("leak_weight", 0.3)
+            quality_weight = config.get("quality_weight", 0.7)
+            final_scores = np.zeros(metagraph.n)
+            for uid, _ in qualified:
+                final_scores[uid] = leak_weight * normalized_leak[uid] + quality_weight * win_rates[uid]
+                logger.info(f"UID {uid}: final={final_scores[uid]:.4f} (leak={normalized_leak[uid]:.4f} quality={win_rates[uid]:.4f})")
+
+    ranked = sorted(
+        [(uid, final_scores[uid]) for uid, _ in qualified if final_scores[uid] > 0 and uid != owner_uid],
+        key=lambda x: x[1], reverse=True,
+    )
+    top_n = ranked[:10]
+
+    if top_n:
+        n = len(top_n)
+        emission_pct = config.get("emission_pct", 1.0)
+        rewards = np.exp(-0.8 * (np.arange(n) ** 0.9))
+        rewards /= rewards.sum()
+        rewards *= emission_pct
+
+        uids = [uid for uid, _ in top_n]
+        weights = list(rewards)
+
+        if emission_pct < 1.0:
+            uids.append(owner_uid)
+            weights.append(1.0 - emission_pct)
+
+        for uid, w in zip(uids, weights):
+            logger.info(f"UID {uid}: weight={w:.4f}")
+    else:
+        logger.info("No non-owner miners in top 10, keeping current weights")
+        uids = None
+        weights = None
+
+    winner = top_n[0][0] if top_n else None
+    results = RoundResults.with_winner(leak_scores, qualified, win_rates, final_scores, winner, uids, weights)
+
+    return final_scores, winner, uids, weights, results
+
+
+def run(args):
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)-8s | %(message)s")
+    logging.getLogger("sn38").setLevel(logging.INFO)
+    logging.getLogger(__name__).setLevel(logging.INFO)
+
+    wallet = bt.Wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
+    api = BackendAPI(BACKEND_URL, hotkey=wallet.hotkey.ss58_address)
+
+    config = api.get_config()
+    eval_round = api.get_eval_round()
+    set_round_cache(eval_round)
+    ALL_YEARS = api.get_years(eval_round)
+    NUM_YEARS = len(ALL_YEARS)
+    logger.info(f"Config: {config}")
+    logger.info(f"Eval round: {eval_round}")
+    logger.info(f"Eval years: {ALL_YEARS}")
+
+    netuid = NETWORKS[args.network]["netuid"]
+    owner_uid = NETWORKS[args.network]["owner_uid"]
+
+    conn = get_connection()
+    subtensor = bt.Subtensor(network=args.network)
+    metagraph = subtensor.metagraph(netuid=netuid)
+
+    _sync_eval_details(api, conn)
+
+    if is_week_evaluated(conn, eval_round):
+        logger.info(f"Round {eval_round} already evaluated, skipping")
+        return
+
+    submissions, submission_times = api.get_submissions(eval_round)
+    if not submissions:
+        logger.info(f"Round {eval_round}: no submissions")
+        mark_week_evaluated(conn, eval_round)
+        return
+
+    if args.test_uids:
+        test_uids = set(int(u) for u in args.test_uids.split(","))
+        submissions = {uid: m for uid, m in submissions.items() if uid in test_uids}
+
+    logger.info(f"Round {eval_round}: {len(submissions)} miners")
+
+    # =========================================
+    # Prefetch models (unavailable ones fail the round here => this prevents miners
+    # from making their model private once qualified
+    # =========================================
+    prefetch_models(api, submissions, config, ALL_YEARS, conn, eval_round)
+
+    # =========================================
+    # Preload benchmarks (fail fast if backend is down)
+    # =========================================
+    benchmarks = _preload_benchmarks(api, ALL_YEARS)
+    logger.info(f"Loaded benchmarks for {len(benchmarks)} years")
+
+    # =========================================
+    # STAGE 1: Leak detection
+    # =========================================
+    logger.info("=== Stage 1: Leak detection + dedup (SVD + cosine) ===")
+    leak_scores = run_stage1(api, submissions, submission_times, config, ALL_YEARS, conn, benchmarks, eval_round)
+    cleanup()
+
+    # =========================================
+    # STAGE 2: Quality evaluation (round-robin)
+    # =========================================
+    config["owner_uid"] = owner_uid
+    config["eval_round"] = eval_round
+    final_scores, winner, uids, weights, results = run_stage2_and_score(
+        api, leak_scores, submissions, submission_times, config, ALL_YEARS, metagraph, conn
+    )
+
+    api.submit_eval_results(eval_round, results.to_dict())
+
+    if uids is None:
+        logger.info("No qualified miners, re-setting current on-chain weights")
+        uids, weights = _get_current_weights(subtensor, netuid, wallet, owner_uid)
+
+    subtensor.set_weights(
+        wallet=wallet, netuid=netuid,
+        uids=uids, weights=weights,
+        wait_for_inclusion=False,
+    )
+    logger.info(f"Weights set: {dict(zip(uids, weights))}")
+
+    mark_week_evaluated(conn, eval_round)
+    logger.info("Done.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--wallet.name", type=str, default="validator", dest="wallet_name")
+    parser.add_argument("--wallet.hotkey", type=str, default="default", dest="wallet_hotkey")
+    parser.add_argument("--subtensor.network", type=str, default="finney", dest="network")
+    parser.add_argument("--test-uids", type=str, default=None, dest="test_uids",
+                        help="Comma-separated UIDs to evaluate (e.g. --test-uids 2,3,5)")
+    args = parser.parse_args()
+    run(args)

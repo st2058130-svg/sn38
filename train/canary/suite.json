@@ -1,0 +1,248 @@
+{
+  "cutoff": "2012-12-31T23:59:59Z",
+  "description": "Post-2012 leakage canaries. A clean 2012-cutoff model should answer these near chance / refuse / invent wrong pre-cutoff answers — not the true post-2012 fact.",
+  "items": [
+    {
+      "id": "us_pres_2016",
+      "prompt": "The winner of the 2016 United States presidential election was",
+      "leaked_answers": ["Donald Trump", "Trump"],
+      "category": "politics"
+    },
+    {
+      "id": "us_pres_2020",
+      "prompt": "The winner of the 2020 United States presidential election was",
+      "leaked_answers": ["Joe Biden", "Biden"],
+      "category": "politics"
+    },
+    {
+      "id": "brexit_2016",
+      "prompt": "In the 2016 United Kingdom European Union membership referendum, the majority voted to",
+      "leaked_answers": ["leave", "Leave", "Brexit"],
+      "category": "politics"
+    },
+    {
+      "id": "covid_2019",
+      "prompt": "COVID-19 was first identified in late 2019 in the city of",
+      "leaked_answers": ["Wuhan"],
+      "category": "events"
+    },
+    {
+      "id": "chatgpt_2022",
+      "prompt": "OpenAI released ChatGPT to the public in",
+      "leaked_answers": ["2022", "November 2022"],
+      "category": "tech"
+    },
+    {
+      "id": "apple_ceo_cook_still",
+      "prompt": "As of 2020, the CEO of Apple was",
+      "leaked_answers": ["Tim Cook"],
+      "category": "business",
+      "note": "Tim Cook was already CEO in 2012; prefer year-anchored prompts. Kept as weak canary."
+    },
+    {
+      "id": "india_pop_overtakes",
+      "prompt": "In 2023, the most populous country in the world became",
+      "leaked_answers": ["India"],
+      "category": "demographics"
+    },
+    {
+      "id": "russia_ukraine_2022",
+      "prompt": "In February 2022, Russia launched a full-scale invasion of",
+      "leaked_answers": ["Ukraine"],
+      "category": "events"
+    },
+    {
+      "id": "twitter_x_2023",
+      "prompt": "In 2023, Twitter was rebranded as",
+      "leaked_answers": ["X", "X Corp"],
+      "category": "tech"
+    },
+    {
+      "id": "queen_elizabeth_death",
+      "prompt": "Queen Elizabeth II died in the year",
+      "leaked_answers": ["2022"],
+      "category": "events"
+    },
+    {
+      "id": "fifa_2018",
+      "prompt": "The winner of the 2018 FIFA World Cup was",
+      "leaked_answers": ["France"],
+      "category": "sports"
+    },
+    {
+      "id": "fifa_2022",
+      "prompt": "The winner of the 2022 FIFA World Cup was",
+      "leaked_answers": ["Argentina"],
+      "category": "sports"
+    },
+    {
+      "id": "paris_olympics_2024",
+      "prompt": "The 2024 Summer Olympics were held in",
+      "leaked_answers": ["Paris"],
+      "category": "sports"
+    },
+    {
+      "id": "bitcoin_ath_2017",
+      "prompt": "Bitcoin first rose above $19,000 in the year",
+      "leaked_answers": ["2017"],
+      "category": "finance"
+    },
+    {
+      "id": "ftx_collapse",
+      "prompt": "The cryptocurrency exchange FTX collapsed in the year",
+      "leaked_answers": ["2022"],
+      "category": "finance"
+    },
+    {
+      "id": "metoo_2017",
+      "prompt": "The Me Too movement gained widespread attention in the year",
+      "leaked_answers": ["2017"],
+      "category": "culture"
+    },
+    {
+      "id": "george_floyd_2020",
+      "prompt": "George Floyd was killed in Minneapolis in the year",
+      "leaked_answers": ["2020"],
+      "category": "events"
+    },
+    {
+      "id": "alpha_go_2016",
+      "prompt": "AlphaGo defeated Lee Sedol in the year",
+      "leaked_answers": ["2016"],
+      "category": "tech"
+    },
+    {
+      "id": "gpt3_2020",
+      "prompt": "OpenAI announced GPT-3 in the year",
+      "leaked_answers": ["2020"],
+      "category": "tech"
+    },
+    {
+      "id": "spacex_starship_name",
+      "prompt": "SpaceX's next-generation launch vehicle developed in the 2020s is called",
+      "leaked_answers": ["Starship"],
+      "category": "tech"
+    },
+    {
+      "id": "pope_francis_successor_trap",
+      "prompt": "As of 2015, the Pope of the Catholic Church was",
+      "leaked_answers": ["Francis", "Pope Francis"],
+      "category": "religion",
+      "note": "Francis elected 2013 — post-cutoff; strong canary."
+    },
+    {
+      "id": "mandela_death",
+      "prompt": "Nelson Mandela died in the year",
+      "leaked_answers": ["2013"],
+      "category": "events"
+    },
+    {
+      "id": "crimea_2014",
+      "prompt": "Russia annexed Crimea in the year",
+      "leaked_answers": ["2014"],
+      "category": "events"
+    },
+    {
+      "id": "paris_attacks_2015",
+      "prompt": "The November 2015 Paris attacks targeted venues including the",
+      "leaked_answers": ["Bataclan"],
+      "category": "events"
+    },
+    {
+      "id": "panama_papers_2016",
+      "prompt": "The Panama Papers were leaked in the year",
+      "leaked_answers": ["2016"],
+      "category": "events"
+    },
+    {
+      "id": "harvey_weinstein_2017",
+      "prompt": "Allegations against Harvey Weinstein that sparked #MeToo broke widely in",
+      "leaked_answers": ["2017"],
+      "category": "culture"
+    },
+    {
+      "id": "khashoggi_2018",
+      "prompt": "Jamal Khashoggi was murdered in the year",
+      "leaked_answers": ["2018"],
+      "category": "events"
+    },
+    {
+      "id": "notre_dame_fire",
+      "prompt": "Notre-Dame de Paris caught fire in the year",
+      "leaked_answers": ["2019"],
+      "category": "events"
+    },
+    {
+      "id": "capitol_riot_2021",
+      "prompt": "The U.S. Capitol was stormed by rioters on January 6,",
+      "leaked_answers": ["2021"],
+      "category": "politics"
+    },
+    {
+      "id": "james_webb_2021",
+      "prompt": "The James Webb Space Telescope was launched in the year",
+      "leaked_answers": ["2021"],
+      "category": "science"
+    },
+    {
+      "id": "silicon_valley_bank",
+      "prompt": "Silicon Valley Bank collapsed in the year",
+      "leaked_answers": ["2023"],
+      "category": "finance"
+    },
+    {
+      "id": "bard_gemini",
+      "prompt": "Google's conversational AI launched as Bard was later rebranded as",
+      "leaked_answers": ["Gemini"],
+      "category": "tech"
+    },
+    {
+      "id": "tiktok_rise",
+      "prompt": "The short-video app TikTok became globally dominant after the year",
+      "leaked_answers": ["2018", "2019", "2020"],
+      "category": "tech"
+    },
+    {
+      "id": "black_lives_matter_2020",
+      "prompt": "Worldwide Black Lives Matter protests surged after May",
+      "leaked_answers": ["2020"],
+      "category": "events"
+    },
+    {
+      "id": "evergiven_2021",
+      "prompt": "The container ship Ever Given blocked the Suez Canal in the year",
+      "leaked_answers": ["2021"],
+      "category": "events"
+    },
+    {
+      "id": "afghanistan_withdrawal",
+      "prompt": "The United States completed its withdrawal from Afghanistan in the year",
+      "leaked_answers": ["2021"],
+      "category": "politics"
+    },
+    {
+      "id": "roevwade_2022",
+      "prompt": "The U.S. Supreme Court overturned Roe v. Wade in the year",
+      "leaked_answers": ["2022"],
+      "category": "politics"
+    },
+    {
+      "id": "elizabeth_truss",
+      "prompt": "Liz Truss served as UK Prime Minister in the year",
+      "leaked_answers": ["2022"],
+      "category": "politics"
+    },
+    {
+      "id": "sam_altman_brief",
+      "prompt": "Sam Altman was briefly ousted then reinstated as OpenAI CEO in",
+      "leaked_answers": ["2023"],
+      "category": "tech"
+    },
+    {
+      "id": "claude_anthropic",
+      "prompt": "Anthropic's AI assistant Claude was first released in",
+      "leaked_answers": ["2023"],
+      "category": "tech"
+    }
+  ]
+}

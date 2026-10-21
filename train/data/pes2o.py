@@ -1,11 +1,12 @@
 """Phase 1.2 — stream peS2o from HuggingFace, keep publication year <= 2012.
 
-Requires: pip install datasets
+Newer `datasets` versions reject Hub dataset scripts (peS2o.py). We load the
+v2 JSON.GZ shards via the generic `json` builder instead.
 
   export SN38_DATA_ROOT=/workspace/sn38-data
   export HF_TOKEN=hf_xxx   # if needed
   python -m train.data.pes2o --max-docs 10000          # smoke
-  python -m train.data.pes2o --finalize                # full stream (long)
+  python -m train.data.pes2o --full-scale --finalize
 """
 
 from __future__ import annotations
@@ -24,16 +25,21 @@ from train.filter.pipeline import decide, filter_jsonl
 logger = logging.getLogger(__name__)
 
 HF_DATASET = os.environ.get("PES2O_DATASET", "allenai/peS2o")
+# Bypass peS2o.py script (unsupported on datasets>=4)
+DEFAULT_DATA_FILES = os.environ.get(
+    "PES2O_DATA_FILES",
+    f"hf://datasets/{HF_DATASET}@main/data/v2/train-*.json.gz",
+)
 SOURCE = "pes2o"
 
 
 def _year_from_row(row: dict) -> int | None:
-    for key in ("year", "publication_year", "date", "publication_date"):
+    for key in ("year", "publication_year", "date", "publication_date", "created"):
         if key not in row or row[key] is None:
             continue
         val = row[key]
         if isinstance(val, int):
-            return val
+            return val if 1800 <= val <= 2100 else None
         text = str(val)
         if len(text) >= 4 and text[:4].isdigit():
             y = int(text[:4])
@@ -52,6 +58,37 @@ def _text_from_row(row: dict) -> str:
     return ""
 
 
+def _load_pes2o_stream(split: str = "train"):
+    """Load peS2o without executing the legacy peS2o.py dataset script."""
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise SystemExit("Install datasets: pip install datasets") from e
+
+    data_files = DEFAULT_DATA_FILES
+    logger.info("Loading peS2o via json builder: %s", data_files)
+    # Generic json builder — does not touch peS2o.py
+    try:
+        return load_dataset("json", data_files=data_files, split="train", streaming=True)
+    except Exception as e1:
+        logger.warning("json/hf:// load failed (%s); trying parquet convert branch", e1)
+        try:
+            return load_dataset(
+                HF_DATASET,
+                name="v2",
+                split=split,
+                streaming=True,
+                revision="refs/convert/parquet",
+            )
+        except Exception as e2:
+            raise SystemExit(
+                "Could not load peS2o with current datasets version.\n"
+                f"  json path error: {e1}\n"
+                f"  parquet branch error: {e2}\n"
+                "Fallback: pip install 'datasets==3.6.0' then retry, or set PES2O_DATA_FILES."
+            ) from e2
+
+
 def stream_pes2o(
     out_path: Path,
     *,
@@ -59,13 +96,8 @@ def stream_pes2o(
     target_tokens: int | None = None,
     split: str = "train",
 ) -> dict:
-    try:
-        from datasets import load_dataset
-    except ImportError as e:
-        raise SystemExit("Install datasets: pip install datasets") from e
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ds = load_dataset(HF_DATASET, split=split, streaming=True)
+    ds = _load_pes2o_stream(split=split)
     kept = skipped = 0
     n_tokens = 0
     with open(out_path, "w", encoding="utf-8") as out:
@@ -102,6 +134,7 @@ def stream_pes2o(
     stats = {
         "source": SOURCE,
         "dataset": HF_DATASET,
+        "data_files": DEFAULT_DATA_FILES,
         "kept": kept,
         "skipped": skipped,
         "est_tokens": n_tokens,

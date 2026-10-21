@@ -43,16 +43,32 @@ start_job() {
     echo "already running: sn38-full-${name}"
     return 0
   fi
+  # Clear stale DONE from a previous failed/short run so status is honest
+  rm -f "$DATA_ROOT/logs/full_${name}.done"
   tmux new-session -d -s "sn38-full-${name}" bash -lc "
     set -a; source $DATA_ROOT/env.sh 2>/dev/null || true; set +a
     export SN38_DATA_ROOT=$DATA_ROOT HF_HOME=$HF_HOME PYTHONPATH=$REPO_ROOT
     cd $REPO_ROOT
-    echo '[start] $(date -Is) $name' | tee -a $log
-    $cmd 2>&1 | tee -a $log
-    echo '[done] $(date -Is) $name' | tee -a $log
-    echo DONE > $DATA_ROOT/logs/full_${name}.done
+    rm -f $DATA_ROOT/logs/full_${name}.done
+    echo '[start] \$(date -Is) $name' | tee -a $log
+    set -o pipefail
+    if $cmd 2>&1 | tee -a $log; then
+      echo '[done-ok] \$(date -Is) $name' | tee -a $log
+      echo DONE > $DATA_ROOT/logs/full_${name}.done
+    else
+      echo '[done-FAIL] \$(date -Is) $name exit=\$?' | tee -a $log
+      echo FAIL > $DATA_ROOT/logs/full_${name}.fail
+      exit 1
+    fi
   "
   echo "started sn38-full-${name}  → $log"
+}
+
+restart_job() {
+  local name="$1"
+  tmux kill-session -t "sn38-full-${name}" 2>/dev/null || true
+  rm -f "$DATA_ROOT/logs/full_${name}.done" "$DATA_ROOT/logs/full_${name}.fail"
+  echo "cleared $name — call start again or use: bash scripts/runpod/run_full_scale.sh restart-$name"
 }
 
 cmd_start() {
@@ -91,7 +107,9 @@ EOF
 
 cmd_status() {
   for name in wiki pes2o fineweb books; do
-    if [[ -f "$DATA_ROOT/logs/full_${name}.done" ]]; then
+    if [[ -f "$DATA_ROOT/logs/full_${name}.fail" ]] && [[ ! -f "$DATA_ROOT/logs/full_${name}.done" ]]; then
+      echo "[FAIL]    $name"
+    elif [[ -f "$DATA_ROOT/logs/full_${name}.done" ]]; then
       echo "[DONE]    $name"
     elif tmux has-session -t "sn38-full-${name}" 2>/dev/null; then
       echo "[RUNNING] $name"
@@ -166,6 +184,16 @@ cmd_stop() {
   done
 }
 
+cmd_restart_pes2o() {
+  restart_job pes2o
+  start_job pes2o "python -m train.data.pes2o --full-scale --finalize"
+}
+
+cmd_restart_books() {
+  restart_job books
+  start_job books "python -m train.data.gutenberg --full-scale --finalize"
+}
+
 case "${1:-start}" in
   start|"") cmd_start ;;
   status) cmd_status ;;
@@ -174,5 +202,7 @@ case "${1:-start}" in
   edu) cmd_edu ;;
   mix) cmd_mix ;;
   stop) cmd_stop ;;
-  *) echo "usage: $0 start|status|snapshot-filtered|snapshot-edu|edu|mix|stop"; exit 1 ;;
+  restart-pes2o) cmd_restart_pes2o ;;
+  restart-books) cmd_restart_books ;;
+  *) echo "usage: $0 start|status|restart-pes2o|restart-books|snapshot-filtered|snapshot-edu|edu|mix|stop"; exit 1 ;;
 esac

@@ -9,8 +9,21 @@ cd /workspace
 git clone <YOUR_REPO_URL> sn38
 cd sn38
 bash scripts/runpod/setup.sh
+# env.sh is written by setup.sh into the data volume (not the git repo).
+# If missing, create it manually (see below) then:
 source /workspace/sn38-data/env.sh
 export HF_TOKEN=hf_xxx
+# Manual env.sh if setup died before writing it:
+# cat > /workspace/sn38-data/env.sh <<'EOF'
+# export SN38_DATA_ROOT=/workspace/sn38-data
+# export SN38_REPO=/workspace/sn38
+# export HF_HOME=/workspace/sn38-data/hf_cache
+# export WIKI_DUMP_ID=20261001
+# export WIKI_DUMP_FORMAT=7z
+# export PYTHONPATH=/workspace/sn38${PYTHONPATH:+:$PYTHONPATH}
+# cd /workspace/sn38
+# EOF
+# source /workspace/sn38-data/env.sh
 # export WIKI_DUMP_ID=20261001
 # export WIKI_DUMP_FORMAT=7z
 # bash scripts/runpod/run_datagen.sh wiki-list

@@ -1,7 +1,5 @@
 """Phase 1.4 — Project Gutenberg (public domain → safe for 2012 cutoff).
 
-Uses HuggingFace `manu/project_gutenberg` or local text files.
-
   python -m train.data.gutenberg --full-scale --finalize
   python -m train.data.gutenberg --max-docs 500
 """
@@ -21,8 +19,41 @@ from train.filter.pipeline import decide, filter_jsonl
 
 logger = logging.getLogger(__name__)
 
-HF_DATASET = os.environ.get("GUTENBERG_DATASET", "manu/project_gutenberg")
+# Prefer datasets that expose a real `default` / train split (no bogus name="en")
+_CANDIDATES = [
+    os.environ.get("GUTENBERG_DATASET", "manu/project_gutenberg"),
+    "sedthh/gutenberg_english",
+]
 SOURCE = "books"
+
+
+def _load_gutenberg():
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise SystemExit("pip install datasets") from e
+
+    last_err = None
+    for repo in _CANDIDATES:
+        if not repo:
+            continue
+        try:
+            logger.info("Loading Gutenberg dataset %s (config=default)", repo)
+            ds = load_dataset(repo, split="train", streaming=True)
+            return ds, repo
+        except Exception as e:
+            last_err = e
+            logger.warning("Failed %s: %s", repo, e)
+            # Some repos need explicit default config name
+            try:
+                ds = load_dataset(repo, name="default", split="train", streaming=True)
+                return ds, repo
+            except Exception as e2:
+                last_err = e2
+                logger.warning("Failed %s name=default: %s", repo, e2)
+    raise SystemExit(
+        f"Could not load any Gutenberg dataset from {_CANDIDATES}. Last error: {last_err}"
+    )
 
 
 def stream_gutenberg(
@@ -31,17 +62,8 @@ def stream_gutenberg(
     max_docs: int | None = None,
     target_tokens: int | None = None,
 ) -> dict:
-    try:
-        from datasets import load_dataset
-    except ImportError as e:
-        raise SystemExit("pip install datasets") from e
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Dataset layouts vary; try common configs
-    try:
-        ds = load_dataset(HF_DATASET, split="train", streaming=True)
-    except Exception:
-        ds = load_dataset(HF_DATASET, name="en", split="train", streaming=True)
+    ds, repo = _load_gutenberg()
 
     kept = skipped = 0
     n_tokens = 0
@@ -55,7 +77,7 @@ def stream_gutenberg(
                 "source": SOURCE,
                 "publication_date": "1910-01-01",  # PD books; pre-cutoff by definition
                 "trusted_pre_cutoff": True,
-                "metadata": {"dataset": HF_DATASET, "id": row.get("id")},
+                "metadata": {"dataset": repo, "id": row.get("id")},
             }
             cleaned = clean_document(doc)
             if cleaned is None:
@@ -76,7 +98,7 @@ def stream_gutenberg(
                 break
     stats = {
         "source": SOURCE,
-        "dataset": HF_DATASET,
+        "dataset": repo,
         "kept": kept,
         "skipped": skipped,
         "est_tokens": n_tokens,

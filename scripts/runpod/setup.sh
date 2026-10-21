@@ -16,7 +16,21 @@ mkdir -p "$DATA_ROOT/raw"/{wikipedia_2012,pes2o,fineweb_edu}
 
 export SN38_DATA_ROOT="$DATA_ROOT"
 export HF_HOME="${HF_HOME:-$DATA_ROOT/hf_cache}"
-export WIKI_DUMP_ID="${WIKI_DUMP_ID:-latest}"
+WIKI_DUMP_ID="${WIKI_DUMP_ID:-20261001}"
+WIKI_DUMP_FORMAT="${WIKI_DUMP_FORMAT:-7z}"
+
+# Write env.sh FIRST so it exists even if apt/pip later fails
+echo "==> Writing env file to $DATA_ROOT/env.sh"
+cat > "$DATA_ROOT/env.sh" <<EOF
+export SN38_DATA_ROOT=$DATA_ROOT
+export SN38_REPO=$REPO_ROOT
+export HF_HOME=$HF_HOME
+export WIKI_DUMP_ID=$WIKI_DUMP_ID
+export WIKI_DUMP_FORMAT=$WIKI_DUMP_FORMAT
+export PYTHONPATH=$REPO_ROOT\${PYTHONPATH:+:\$PYTHONPATH}
+cd $REPO_ROOT
+EOF
+ls -la "$DATA_ROOT/env.sh"
 
 cd "$REPO_ROOT"
 
@@ -40,20 +54,6 @@ fi
 
 # Datagen extras (streaming HF datasets)
 python3 -m pip install -q datasets
-
-WIKI_DUMP_ID="${WIKI_DUMP_ID:-20261001}"
-WIKI_DUMP_FORMAT="${WIKI_DUMP_FORMAT:-7z}"
-
-echo "==> Writing env file to $DATA_ROOT/env.sh"
-cat > "$DATA_ROOT/env.sh" <<EOF
-export SN38_DATA_ROOT=$DATA_ROOT
-export SN38_REPO=$REPO_ROOT
-export HF_HOME=$HF_HOME
-export WIKI_DUMP_ID=$WIKI_DUMP_ID
-export WIKI_DUMP_FORMAT=$WIKI_DUMP_FORMAT
-export PYTHONPATH=$REPO_ROOT\${PYTHONPATH:+:\$PYTHONPATH}
-cd $REPO_ROOT
-EOF
 
 echo "==> Done. Next:"
 echo "    source $DATA_ROOT/env.sh"

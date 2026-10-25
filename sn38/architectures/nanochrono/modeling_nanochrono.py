@@ -8,15 +8,103 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 
 from .configuration_nanochrono import NanochronoConfig
 
+# (seq_len, window, device_str) → BlockMask for flex_attention sliding-window causal
+_FLEX_MASK_CACHE: dict = {}
+_ATTN_BACKEND_LOGGED: set[str] = set()
+_ATTN_FAIL_LOGGED: set[str] = set()
+_FLEX_ATTN_FN = None
+try:
+    from flash_attn import flash_attn_func as _FLASH_ATTN_FUNC
+except Exception:
+    _FLASH_ATTN_FUNC = None
+
 
 def _norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
+
+def _log_attn_backend(name: str):
+    """Log each distinct attention backend once (hybrid models use more than one)."""
+    if name in _ATTN_BACKEND_LOGGED:
+        return
+    _ATTN_BACKEND_LOGGED.add(name)
+    import logging
+
+    logging.getLogger(__name__).info("nanochrono attention backend: %s", name)
+
+
+def _log_attn_fail(name: str, err: BaseException):
+    if name in _ATTN_FAIL_LOGGED:
+        return
+    _ATTN_FAIL_LOGGED.add(name)
+    import logging
+
+    logging.getLogger(__name__).warning("nanochrono attention %s failed: %s: %s", name, type(err).__name__, err)
 
 
 def _rotate(x, cos, sin):
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
     return torch.cat([x1 * cos + x2 * sin, x2 * cos - x1 * sin], -1)
+
+
+def _sdpa_safe(q, k, v, *, is_causal: bool = False, attn_mask=None):
+    """SDPA without cuDNN — Blackwell (B200/B300) often hits 'No valid execution plans' on cudnn SDPA."""
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        backends = [
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
+        ]
+        with sdpa_kernel(backends):
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+    except Exception:
+        if q.is_cuda:
+            torch.backends.cuda.enable_cudnn_sdp(False)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+
+
+def _flex_attend(q, k, v, window: int):
+    """flex_attention with causal (+ optional sliding) BlockMask. q/k/v: (B,H,T,D)."""
+    global _FLEX_ATTN_FN
+    import os
+
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    if _FLEX_ATTN_FN is None:
+        # Default: compile (usually faster after warmup). Disable: SN38_FLEX_COMPILE=0
+        if os.environ.get("SN38_FLEX_COMPILE", "1") not in {"0", "false", "False"}:
+            try:
+                _FLEX_ATTN_FN = torch.compile(flex_attention)
+            except Exception:
+                _FLEX_ATTN_FN = flex_attention
+        else:
+            _FLEX_ATTN_FN = flex_attention
+
+    T = q.size(2)
+    # window < 0 or >= T → full causal (same as SDPA is_causal=True)
+    w = -1 if window < 0 or window >= T else int(window)
+    key = (T, w, str(q.device))
+    if key not in _FLEX_MASK_CACHE:
+        if w < 0:
+
+            def causal(b, h, q_idx, kv_idx):
+                return q_idx >= kv_idx
+
+            _FLEX_MASK_CACHE[key] = create_block_mask(causal, None, None, T, T, device=q.device)
+        else:
+
+            def sliding_window_causal(b, h, q_idx, kv_idx, window_size=w):
+                return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= window_size)
+
+            _FLEX_MASK_CACHE[key] = create_block_mask(
+                sliding_window_causal, None, None, T, T, device=q.device
+            )
+    return _FLEX_ATTN_FN(q, k, v, block_mask=_FLEX_MASK_CACHE[key]), (
+        "flex_attention_causal" if w < 0 else "flex_attention_sliding"
+    )
 
 
 class NanochronoAttention(nn.Module):
@@ -63,15 +151,68 @@ class NanochronoAttention(nn.Module):
         return self.o_proj(y)
 
     def _attend(self, q, k, v, window, mask, past_len):
+        """q/k/v: (B, H, T, D). Prefer flash-attn / flex_attention; dense masks are very slow."""
         Tq, Tk = q.size(2), k.size(2)
+        # Autocast sometimes leaves these float32; flash/flex need fp16/bf16 — cast so we
+        # don't silently fall through to the dense-mask path (~30k tok/s on A100).
+        if (
+            mask is None
+            and past_len == 0
+            and q.is_cuda
+            and q.dtype not in (torch.float16, torch.bfloat16)
+        ):
+            attn_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            q, k, v = q.to(attn_dtype), k.to(attn_dtype), v.to(attn_dtype)
+
+        if mask is None and past_len == 0 and q.dtype in (torch.float16, torch.bfloat16):
+            if _FLASH_ATTN_FUNC is not None:
+                try:
+                    qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                    if Tq == Tk:
+                        if window < 0 or window >= Tk:
+                            _log_attn_backend("flash_attn_causal")
+                            out = _FLASH_ATTN_FUNC(qh, kh, vh, causal=True)
+                        else:
+                            _log_attn_backend("flash_attn_sliding")
+                            out = _FLASH_ATTN_FUNC(qh, kh, vh, causal=True, window_size=(int(window), 0))
+                        return out.transpose(1, 2).to(q.dtype)
+                    if Tq == 1:
+                        if 0 <= window < Tk:
+                            kh = kh[:, Tk - (window + 1) :,]
+                            vh = vh[:, Tk - (window + 1) :,]
+                        out = _FLASH_ATTN_FUNC(qh, kh, vh, causal=False)
+                        return out.transpose(1, 2).to(q.dtype)
+                except Exception as e:
+                    _log_attn_fail("flash_attn", e)
+
+            # Full causal: PyTorch flash SDPA (often much faster than flex on B300).
+            # Sliding window: flex (or flash_attn package above).
+            if Tq == Tk and (window < 0 or window >= Tk):
+                try:
+                    out = _sdpa_safe(q, k, v, is_causal=True)
+                    _log_attn_backend("sdpa_flash_causal")
+                    return out
+                except Exception as e:
+                    _log_attn_fail("sdpa_flash_causal", e)
+
+            if Tq == Tk:
+                try:
+                    out, name = _flex_attend(q, k, v, int(window))
+                    _log_attn_backend(name)
+                    return out
+                except Exception as e:
+                    _log_attn_fail("flex_attention", e)
+
         if mask is None:
             if Tq == Tk and (window < 0 or window >= Tk):
-                return F.scaled_dot_product_attention(q, k, v, is_causal=Tq > 1)
+                _log_attn_backend("sdpa_causal_no_cudnn")
+                return _sdpa_safe(q, k, v, is_causal=Tq > 1)
             if Tq == 1:
                 if 0 <= window < Tk:
-                    k = k[:, :, Tk - (window + 1):]
-                    v = v[:, :, Tk - (window + 1):]
-                return F.scaled_dot_product_attention(q, k, v)
+                    k = k[:, :, Tk - (window + 1) :]
+                    v = v[:, :, Tk - (window + 1) :]
+                return _sdpa_safe(q, k, v)
+        _log_attn_backend(f"sdpa_dense_mask_slow dtype={q.dtype}")
         row = past_len + torch.arange(Tq, device=q.device).unsqueeze(1)
         col = torch.arange(Tk, device=q.device).unsqueeze(0)
         m = col <= row
@@ -80,7 +221,7 @@ class NanochronoAttention(nn.Module):
         m = m.unsqueeze(0).unsqueeze(0)
         if mask is not None:
             m = m & mask[:, None, None, :Tk].to(torch.bool)
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=m)
+        return _sdpa_safe(q, k, v, attn_mask=m)
 
 
 class NanochronoMLP(nn.Module):

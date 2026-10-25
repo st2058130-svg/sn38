@@ -1,10 +1,18 @@
-"""Load Ti-Ma/wikipedia_2012 (HF) → filtered JSONL for 2012-cutoff training.
+"""Load Ti-Ma Wikipedia (HF) → filtered JSONL for cutoff training.
 
-Dataset: https://huggingface.co/datasets/Ti-Ma/wikipedia_2012
-Already snapshot to 2012-12-31; we drop non-mainspace junk and run Phase 2.
+Datasets:
+  https://huggingface.co/datasets/Ti-Ma/wikipedia_2012
+  https://huggingface.co/datasets/Ti-Ma/wikipedia_2011
+
+Already snapshot to that year's Dec 31; we drop non-mainspace junk and run Phase 2.
+Output stem stays ``wikipedia_2012.jsonl`` so MIX_SHARES keeps working (name = mix key).
 
   export SN38_DATA_ROOT=/workspace/sn38-data
+  # 2012:
   python -m train.data.ti_ma_wikipedia --finalize
+  # 2011 (set config CUTOFF* to 2011 first):
+  export TI_MA_WIKI_DATASET=Ti-Ma/wikipedia_2011
+  python -m train.data.ti_ma_wikipedia --dataset Ti-Ma/wikipedia_2011 --finalize
   python -m train.data.ti_ma_wikipedia --max-docs 10000   # smoke
 """
 
@@ -61,6 +69,7 @@ def is_mainspace_title(title: str) -> bool:
 def stream_ti_ma(
     out_path: Path,
     *,
+    dataset: str | None = None,
     max_docs: int | None = None,
     target_tokens: int | None = None,
     min_chars: int = MIN_DOC_CHARS,
@@ -70,8 +79,10 @@ def stream_ti_ma(
     except ImportError as e:
         raise SystemExit("pip install datasets") from e
 
+    repo = dataset or HF_DATASET
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ds = load_dataset(HF_DATASET, split="train", streaming=True)
+    logger.info("Streaming %s (cutoff=%s)", repo, CUTOFF_ISO)
+    ds = load_dataset(repo, split="train", streaming=True)
 
     kept = skipped_ns = skipped_quality = skipped_date = 0
     total_chars = 0
@@ -99,7 +110,7 @@ def stream_ti_ma(
                     skipped_date += 1
                     continue
             if pub is None:
-                pub = "2012-12-31T23:59:59Z"
+                pub = CUTOFF_ISO
 
             doc = {
                 "text": text,
@@ -113,7 +124,7 @@ def stream_ti_ma(
                     "rev_id": row.get("revision_id"),
                     "year": row.get("year"),
                     "cutoff": CUTOFF_ISO,
-                    "dataset": HF_DATASET,
+                    "dataset": repo,
                 },
             }
             cleaned = clean_document(doc)
@@ -143,7 +154,7 @@ def stream_ti_ma(
 
     n_tok = total_chars // 4
     stats = {
-        "dataset": HF_DATASET,
+        "dataset": repo,
         "kept": kept,
         "skipped_namespace": skipped_ns,
         "skipped_quality_or_filter": skipped_quality,
@@ -160,7 +171,13 @@ def stream_ti_ma(
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s | %(message)s")
-    parser = argparse.ArgumentParser(description="Ti-Ma wikipedia_2012 → JSONL")
+    parser = argparse.ArgumentParser(description="Ti-Ma Wikipedia → JSONL")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="HF repo (default: $TI_MA_WIKI_DATASET or Ti-Ma/wikipedia_2012)",
+    )
     parser.add_argument("--out", type=str, default=str(RAW_DIR / "wikipedia_2012" / "ti_ma_wiki.jsonl"))
     parser.add_argument("--max-docs", type=int, default=None)
     parser.add_argument("--target-tokens", type=int, default=None)
@@ -170,7 +187,11 @@ def main():
         help=f"Aim for plan mid target {TARGET_TOKENS['wikipedia_2012']} tokens (Ti-Ma may be smaller — take all)",
     )
     parser.add_argument("--min-chars", type=int, default=MIN_DOC_CHARS)
-    parser.add_argument("--finalize", action="store_true", help="Also write filtered/wikipedia_2012.jsonl")
+    parser.add_argument(
+        "--finalize",
+        action="store_true",
+        help="Also write filtered/wikipedia_2012.jsonl (mix key; works for 2011 Ti-Ma too)",
+    )
     args = parser.parse_args()
 
     # full-scale: stream entire Ti-Ma (target only stops early if somehow huge)
@@ -178,7 +199,11 @@ def main():
     if args.full_scale:
         target = None  # take all Ti-Ma; supplement with Wikimedia later if under 2B
     stats = stream_ti_ma(
-        Path(args.out), max_docs=args.max_docs, target_tokens=target, min_chars=args.min_chars
+        Path(args.out),
+        dataset=args.dataset,
+        max_docs=args.max_docs,
+        target_tokens=target,
+        min_chars=args.min_chars,
     )
     if args.finalize:
         filtered = FILTERED_DIR / "wikipedia_2012.jsonl"

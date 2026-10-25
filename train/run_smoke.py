@@ -35,7 +35,7 @@ def main():
     logger.info("filter stats: %s", stats)
 
     mix_path = MIX_DIR / "smoke_mix.jsonl"
-    mix_stats = build_mix([(filtered, "smoke", DEFAULT_LOSS_WEIGHT)], mix_path)
+    mix_stats = build_mix([(filtered, "smoke", DEFAULT_LOSS_WEIGHT)], mix_path, total_tokens=None)
     logger.info("mix stats: %s", mix_stats)
 
     # canary self-check without a model
@@ -59,6 +59,8 @@ def main():
             "--steps", str(args.steps),
             "--batch-size", "1",
             "--grad-accum", "1",
+            "--tiny",
+            "--num-workers", "0",
         ]
         logger.info("Running: %s", " ".join(cmd))
         subprocess.check_call(cmd, cwd=str(TRAIN_ROOT.parent))

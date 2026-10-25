@@ -3,6 +3,7 @@
   export SN38_DATA_ROOT=/workspace/sn38-data
   python -m train.data.build_mix_all
   python -m train.data.build_mix_all --skip-edu   # if filtered_edu/ already built
+  python -m train.data.build_mix_all --skip-edu --dry-run   # only print the mix plan (shares / epochs)
 """
 
 from __future__ import annotations
@@ -15,12 +16,13 @@ from pathlib import Path
 from train.config import (
     DEFAULT_LOSS_WEIGHT,
     EDU_DIR,
+    FINEWEB_EDU_SKIP_STEMS,
     FILTERED_DIR,
     MIX_DIR,
     QA_DIR,
     QA_LOSS_WEIGHT,
 )
-from train.data.mix import build_mix
+from train.data.mix import add_mix_args, build_mix, parse_kv
 from train.qa.build_2012_qa import build as build_qa
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ def main():
     )
     parser.add_argument("--min-int-score", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    add_mix_args(parser)
     args = parser.parse_args()
 
     filtered = Path(args.filtered_dir)
@@ -76,14 +79,28 @@ def main():
         logger.warning("No %s — skipping QA build", wiki)
 
     shards = []
-    for path in sorted(mix_root.glob("*.jsonl")):
+    paths = sorted(mix_root.glob("*.jsonl"))
+    if mix_root != filtered:
+        # sources skipped by the edu classifier (usenet, news) are not in edu_dir — take them from filtered
+        have = {p.stem for p in paths}
+        paths += sorted(
+            p for p in filtered.glob("*.jsonl") if p.stem in FINEWEB_EDU_SKIP_STEMS and p.stem not in have and p.stem != "qa_2012"
+        )
+    for path in paths:
         source = path.stem
         weight = QA_LOSS_WEIGHT if "qa" in source else DEFAULT_LOSS_WEIGHT
         shards.append((path, source, weight))
     if qa_path.exists():
         shards.append((qa_path, "qa_2012", QA_LOSS_WEIGHT))
 
-    report["mix"] = build_mix(shards, Path(args.out))
+    report["mix"] = build_mix(
+        shards,
+        Path(args.out),
+        total_tokens=args.total_tokens,
+        shares=parse_kv(args.share),
+        max_epochs=parse_kv(args.max_epochs),
+        dry_run=args.dry_run,
+    )
     report["mix_root"] = str(mix_root)
     print(json.dumps(report, indent=2))
 

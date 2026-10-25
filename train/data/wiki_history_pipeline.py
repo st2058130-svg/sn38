@@ -14,6 +14,7 @@ Examples
   export SN38_DATA_ROOT=/workspace/sn38-data
   python -m train.data.wiki_history_pipeline --dump-id 20261001 --list
   python -m train.data.wiki_history_pipeline --dump-id 20261001 --finalize
+  python -m train.data.wiki_history_pipeline --dump-id 20261001 --workers 2 --finalize
   python -m train.data.wiki_history_pipeline --dump-id 20261001 --max-shards 3
 """
 
@@ -26,6 +27,8 @@ import os
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 
 from train.config import CUTOFF_ISO, FILTERED_DIR, RAW_DIR, STATE_DIR
@@ -176,6 +179,68 @@ def save_state(dump_id: str, fmt: str, state: dict) -> None:
     _state_path(dump_id, fmt).write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+def _lock_path(dump_id: str, fmt: str) -> Path:
+    return _state_path(dump_id, fmt).with_suffix(".lock")
+
+
+@contextmanager
+def _exclusive_lock(dump_id: str, fmt: str):
+    """Cross-process lock so parallel workers can update state safely."""
+    path = _lock_path(dump_id, fmt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+def _mark_shard_result(
+    dump_id: str,
+    fmt: str,
+    name: str,
+    *,
+    ok: bool,
+    kept: int = 0,
+    error: str | None = None,
+) -> None:
+    with _exclusive_lock(dump_id, fmt):
+        state = load_state(dump_id, fmt)
+        if ok:
+            if name not in state["completed"]:
+                state["completed"].append(name)
+            state["failed"].pop(name, None)
+            state["kept_filtered"] = int(state.get("kept_filtered") or 0) + int(kept)
+        else:
+            state.setdefault("failed", {})[name] = error or "unknown"
+        save_state(dump_id, fmt, state)
+
+
 def _shard_stem(name: str) -> str:
     stem = name
     for ext in (".xml.bz2", ".xml.7z", ".bz2", ".7z"):
@@ -232,6 +297,60 @@ def filter_raw_to_trainable(raw_path: Path, filtered_part: Path) -> dict:
     return stats
 
 
+def _process_shard_task(task: dict) -> dict:
+    """Worker entry: one shard download→extract→filter→delete. Safe to run in a subprocess."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-8s | %(message)s")
+    log = logging.getLogger("wiki_worker")
+
+    name = task["name"]
+    dump_id = task["dump_id"]
+    fmt = task["fmt"]
+    index = task["index"]
+    total = task["total"]
+    shard_dir = Path(task["shard_dir"])
+    raw_tmp_dir = Path(task["raw_tmp_dir"])
+    filtered_parts_dir = Path(task["filtered_parts_dir"])
+    keep_shards = task["keep_shards"]
+    keep_raw = task["keep_raw"]
+    shard_limit_pages = task.get("shard_limit_pages")
+
+    stem = _shard_stem(name)
+    local = shard_dir / name
+    raw_part = raw_tmp_dir / f"{stem}.jsonl"
+    filtered_part = filtered_parts_dir / f"{stem}.jsonl"
+    filtered_tmp = filtered_part.with_suffix(".jsonl.partial")
+
+    log.info("[%d/%d] %s (%.2f GB remote)", index, total, name, (task.get("size") or 0) / 1e9)
+    try:
+        if not local.exists() or local.stat().st_size < MIN_SHARD_BYTES:
+            download_file(task["url"], local)
+
+        extract_stats = extract_dump(local, raw_part, limit=shard_limit_pages, append=False)
+        fstats = filter_raw_to_trainable(raw_part, filtered_tmp)
+        filtered_tmp.replace(filtered_part)
+        kept = int(fstats["kept"])
+        _mark_shard_result(dump_id, fmt, name, ok=True, kept=kept)
+        log.info(
+            "Shard done extract_kept=%s filtered_kept=%s",
+            extract_stats.get("kept"),
+            kept,
+        )
+        return {"ok": True, "name": name, "kept": kept, "index": index}
+    except Exception as e:
+        log.exception("Shard failed %s: %s", name, e)
+        filtered_part.unlink(missing_ok=True)
+        filtered_tmp.unlink(missing_ok=True)
+        _mark_shard_result(dump_id, fmt, name, ok=False, error=str(e))
+        return {"ok": False, "name": name, "error": str(e), "index": index}
+    finally:
+        if not keep_shards and local.exists():
+            local.unlink(missing_ok=True)
+            log.info("Deleted archive %s", name)
+        if not keep_raw and raw_part.exists():
+            raw_part.unlink(missing_ok=True)
+            log.info("Deleted raw extract %s", raw_part.name)
+
+
 def process_shards(
     dump_id: str,
     *,
@@ -242,8 +361,9 @@ def process_shards(
     keep_raw: bool = False,
     shard_limit_pages: int | None = None,
     out_jsonl: Path | None = None,
+    workers: int = 1,
 ) -> dict:
-    """Download→extract→filter→delete per shard. Disk peak ≈ one archive + one raw part."""
+    """Download→extract→filter→delete per shard. Disk peak ≈ workers × one archive."""
     shards = list_history_shards(dump_id, fmt=fmt)
     if not shards:
         raise SystemExit("No history shards found")
@@ -252,24 +372,33 @@ def process_shards(
     if max_shards is not None:
         shards = shards[:max_shards]
 
-    state = load_state(dump_id, fmt) if resume else {
-        "dump_id": dump_id,
-        "fmt": fmt,
-        "cutoff": CUTOFF_ISO,
-        "completed": [],
-        "failed": {},
-        "kept_filtered": 0,
-    }
+    workers = max(1, int(workers))
+    if workers > 4:
+        logger.warning("workers=%d is high for ≤128GB RAM — recommend 2 (max ~3)", workers)
+
+    if not resume:
+        state = {
+            "dump_id": dump_id,
+            "fmt": fmt,
+            "cutoff": CUTOFF_ISO,
+            "completed": [],
+            "failed": {},
+            "kept_filtered": 0,
+        }
+        save_state(dump_id, fmt, state)
+    else:
+        state = load_state(dump_id, fmt)
     done = set(state.get("completed") or [])
 
     shard_dir = RAW_DIR / "wikipedia_2012" / "shards" / dump_id
     raw_tmp_dir = RAW_DIR / "wikipedia_2012" / "raw_tmp" / dump_id
     filtered_parts_dir = RAW_DIR / "wikipedia_2012" / "filtered_parts" / dump_id
+    shard_dir.mkdir(parents=True, exist_ok=True)
     filtered_parts_dir.mkdir(parents=True, exist_ok=True)
     raw_tmp_dir.mkdir(parents=True, exist_ok=True)
     out_jsonl = out_jsonl or (FILTERED_DIR / "wikipedia_2012.jsonl")
 
-    t0 = time.time()
+    tasks: list[dict] = []
     for i, shard in enumerate(shards, 1):
         name = shard["name"]
         stem = _shard_stem(name)
@@ -277,51 +406,74 @@ def process_shards(
         if name in done and filtered_part.exists():
             logger.info("[%d/%d] skip completed %s", i, len(shards), name)
             continue
+        tasks.append(
+            {
+                "name": name,
+                "url": shard["url"],
+                "size": shard.get("size") or 0,
+                "dump_id": dump_id,
+                "fmt": fmt,
+                "index": i,
+                "total": len(shards),
+                "shard_dir": str(shard_dir),
+                "raw_tmp_dir": str(raw_tmp_dir),
+                "filtered_parts_dir": str(filtered_parts_dir),
+                "keep_shards": keep_shards,
+                "keep_raw": keep_raw,
+                "shard_limit_pages": shard_limit_pages,
+            }
+        )
 
-        local = shard_dir / name
-        raw_part = raw_tmp_dir / f"{stem}.jsonl"
-        logger.info("[%d/%d] %s (%.2f GB remote)", i, len(shards), name, (shard["size"] or 0) / 1e9)
-        try:
-            if not local.exists() or local.stat().st_size < MIN_SHARD_BYTES:
-                download_file(shard["url"], local)
+    logger.info(
+        "Pending shards=%d / %d  workers=%d  (resume completed=%d)",
+        len(tasks),
+        len(shards),
+        workers,
+        len(done),
+    )
 
-            # 1) extract cutoff revisions to temp raw
-            extract_stats = extract_dump(local, raw_part, limit=shard_limit_pages, append=False)
+    t0 = time.time()
+    n_ok = n_fail = 0
+    if not tasks:
+        logger.info("Nothing pending — all shards already completed")
+    elif workers == 1:
+        for task in tasks:
+            result = _process_shard_task(task)
+            if result.get("ok"):
+                n_ok += 1
+            else:
+                n_fail += 1
+                raise RuntimeError(f"Shard failed {result.get('name')}: {result.get('error')}")
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_process_shard_task, task) for task in tasks]
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result.get("ok"):
+                    n_ok += 1
+                    logger.info(
+                        "Worker OK %s kept=%s (%d ok / %d fail / %d pending-done)",
+                        result.get("name"),
+                        result.get("kept"),
+                        n_ok,
+                        n_fail,
+                        n_ok + n_fail,
+                    )
+                else:
+                    n_fail += 1
+                    logger.error("Worker FAIL %s: %s", result.get("name"), result.get("error"))
 
-            # 2) immediately filter to trainable part
-            fstats = filter_raw_to_trainable(raw_part, filtered_part)
-
-            if name not in state["completed"]:
-                state["completed"].append(name)
-            state["failed"].pop(name, None)
-            state["kept_filtered"] = int(state.get("kept_filtered") or 0) + int(fstats["kept"])
-            save_state(dump_id, fmt, state)
-            logger.info(
-                "Shard done extract_kept=%s filtered_kept=%s",
-                extract_stats.get("kept"),
-                fstats["kept"],
-            )
-        except Exception as e:
-            logger.exception("Shard failed %s: %s", name, e)
-            state.setdefault("failed", {})[name] = str(e)
-            save_state(dump_id, fmt, state)
-            filtered_part.unlink(missing_ok=True)
-            raise
-        finally:
-            # 3) never accumulate archives (241GB) or raw extracts
-            if not keep_shards and local.exists():
-                local.unlink(missing_ok=True)
-                logger.info("Deleted archive %s", name)
-            if not keep_raw and raw_part.exists():
-                raw_part.unlink(missing_ok=True)
-                logger.info("Deleted raw extract %s", raw_part.name)
-
+    state = load_state(dump_id, fmt)
     n_lines = _merge_shard_jsonls(filtered_parts_dir, out_jsonl)
     summary = {
         "dump_id": dump_id,
         "fmt": fmt,
+        "workers": workers,
         "shards_total": len(shards),
-        "shards_completed": len(state["completed"]),
+        "shards_pending": len(tasks),
+        "shards_ok_this_run": n_ok,
+        "shards_failed_this_run": n_fail,
+        "shards_completed": len(state.get("completed") or []),
         "kept_filtered_total": n_lines,
         "filtered_parts_dir": str(filtered_parts_dir),
         "out": str(out_jsonl),
@@ -330,6 +482,8 @@ def process_shards(
         "cutoff": CUTOFF_ISO,
         "note": "Archives deleted after each shard; only filtered JSONL parts retained",
     }
+    if n_fail:
+        raise SystemExit(f"Wiki pipeline finished with {n_fail} shard failure(s): {summary}")
     return summary
 
 
@@ -360,6 +514,12 @@ def main():
     )
     parser.add_argument("--list", action="store_true", help="Only list shards + sizes")
     parser.add_argument("--max-shards", type=int, default=None)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("WIKI_WORKERS", "1")),
+        help="Parallel shard workers (recommend 2 on 128GB; 3 max). Env: WIKI_WORKERS",
+    )
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--keep-shards", action="store_true", help="Do NOT delete 7z/bz2 (uses lots of disk)")
     parser.add_argument("--keep-raw", action="store_true", help="Do NOT delete raw extracts after filter")
@@ -411,6 +571,7 @@ def main():
         keep_raw=args.keep_raw,
         shard_limit_pages=args.shard_limit_pages,
         out_jsonl=Path(args.out) if args.out else None,
+        workers=args.workers,
     )
     if not args.finalize and args.out is None:
         # still wrote filtered out by default in process_shards

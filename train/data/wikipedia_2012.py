@@ -190,43 +190,6 @@ class _ProcStdout:
             self.proc.wait(timeout=30)
 
 
-def _page_from_element(page_el: ET.Element) -> PageHit | None:
-    title = page_id = None
-    ns = 0
-    best: Revision | None = None
-    is_redir_el = False
-
-    for child in page_el:
-        tag = _local(child.tag)
-        if tag == "title":
-            title = (child.text or "").strip()
-        elif tag == "id":
-            page_id = (child.text or "").strip()
-        elif tag == "ns":
-            try:
-                ns = int((child.text or "0").strip())
-            except ValueError:
-                ns = 0
-        elif tag == "redirect":
-            is_redir_el = True
-        elif tag == "revision":
-            rev = _revision_from_element(child)
-            if rev is None:
-                continue
-            if rev.timestamp > CUTOFF:
-                continue
-            if best is None or rev.timestamp > best.timestamp:
-                best = rev
-
-    if is_redir_el or not title or best is None:
-        return None
-    if ns != 0:
-        return None
-    if is_redirect(best.text):
-        return None
-    return PageHit(title=title, page_id=page_id, ns=ns, revision=best)
-
-
 def _revision_from_element(rev_el: ET.Element) -> Revision | None:
     rev_id = None
     timestamp = None
@@ -251,16 +214,79 @@ def _revision_from_element(rev_el: ET.Element) -> Revision | None:
 
 
 def iter_dump_pages(path: Path) -> Iterator[PageHit]:
-    """Stream MediaWiki XML; yield one PageHit per page (best pre-cutoff revision)."""
+    """Stream MediaWiki XML; yield one PageHit per page (best pre-cutoff revision).
+
+    Clears each <revision> as soon as it ends so hot pages (tens of thousands of
+    revisions) cannot accumulate multi‑GB ElementTrees in RAM.
+    """
     with open_dump(path) as fh:
-        context = ET.iterparse(fh, events=("end",))
+        context = ET.iterparse(fh, events=("start", "end"))
+        title: str | None = None
+        page_id: str | None = None
+        ns = 0
+        is_redir_el = False
+        best: Revision | None = None
+        in_page = False
+        in_revision = False
+
         for event, elem in context:
-            if _local(elem.tag) != "page":
+            tag = _local(elem.tag)
+            if event == "start":
+                if tag == "page":
+                    in_page = True
+                    in_revision = False
+                    title = page_id = None
+                    ns = 0
+                    is_redir_el = False
+                    best = None
+                elif tag == "revision" and in_page:
+                    in_revision = True
                 continue
-            hit = _page_from_element(elem)
-            elem.clear()
-            if hit is not None:
-                yield hit
+
+            # end events
+            if tag == "revision" and in_page:
+                # Parse then drop the whole revision subtree (keeps only `best` in Python).
+                rev = _revision_from_element(elem)
+                elem.clear()
+                in_revision = False
+                if rev is not None and rev.timestamp <= CUTOFF:
+                    if best is None or rev.timestamp > best.timestamp:
+                        best = rev
+                continue
+
+            if in_revision:
+                # Leave revision children intact until </revision> (handled above).
+                continue
+
+            if not in_page:
+                elem.clear()
+                continue
+
+            if tag == "title":
+                title = (elem.text or "").strip()
+            elif tag == "ns":
+                try:
+                    ns = int((elem.text or "0").strip())
+                except ValueError:
+                    ns = 0
+            elif tag == "id" and page_id is None:
+                page_id = (elem.text or "").strip()
+            elif tag == "redirect":
+                is_redir_el = True
+            elif tag == "page":
+                hit: PageHit | None = None
+                if (
+                    not is_redir_el
+                    and title
+                    and best is not None
+                    and ns == 0
+                    and not is_redirect(best.text)
+                ):
+                    hit = PageHit(title=title, page_id=page_id, ns=ns, revision=best)
+                elem.clear()
+                in_page = False
+                if hit is not None:
+                    yield hit
 
 
 def page_to_record(hit: PageHit, *, min_chars: int = MIN_DOC_CHARS) -> dict | None:

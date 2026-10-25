@@ -15,7 +15,7 @@ from train.filter.year_scan import is_past_event_leak
 
 logger = logging.getLogger(__name__)
 
-HIGH_CONFIDENCE_SOURCES = frozenset({"wikipedia_2012", "usenet", "pes2o", "gutenberg"})
+HIGH_CONFIDENCE_SOURCES = frozenset({"wikipedia_2012", "usenet", "pes2o", "gutenberg", "books"})
 
 
 @dataclass
@@ -93,17 +93,32 @@ def filter_records(records: Iterable[dict], source: str | None = None) -> tuple[
 
 
 def filter_jsonl(in_path: Path, out_path: Path, source: str | None = None) -> dict:
-    records = []
-    with open(in_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    kept, stats = filter_records(records, source=source)
+    """Stream JSONL → JSONL (does not load the whole file into RAM)."""
+    stats = {"kept": 0, "discarded": 0, "reasons": {}}
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        for doc in kept:
-            f.write(json.dumps(doc, ensure_ascii=False) + "\n")
+    with open(in_path, encoding="utf-8") as fin, open(out_path, "w", encoding="utf-8") as fout:
+        for line in fin:
+            line = line.strip()
+            if not line:
+                continue
+            doc = json.loads(line)
+            decision = decide(doc, source=source)
+            stats["reasons"][decision.reason] = stats["reasons"].get(decision.reason, 0) + 1
+            if not decision.keep:
+                stats["discarded"] += 1
+                continue
+            out = dict(doc)
+            out["_filter"] = asdict(decision)
+            out["_cutoff"] = CUTOFF_ISO
+            fout.write(json.dumps(out, ensure_ascii=False) + "\n")
+            stats["kept"] += 1
+            if stats["kept"] % 100_000 == 0:
+                logger.info(
+                    "Filter %s progress kept=%d discarded=%d",
+                    in_path.name,
+                    stats["kept"],
+                    stats["discarded"],
+                )
     stats["in_path"] = str(in_path)
     stats["out_path"] = str(out_path)
     logger.info("Filter %s → kept=%d discarded=%d", in_path.name, stats["kept"], stats["discarded"])

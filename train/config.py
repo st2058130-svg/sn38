@@ -133,16 +133,24 @@ TOKEN_BUDGET = {
     "fineweb_edu": (10_000_000_000, 15_000_000_000),
     "books": (3_000_000_000, 5_000_000_000),
     "usenet": (10_000_000_000, 12_000_000_000),
-    "qa_2012": (500_000_000, 1_000_000_000),
+    # cutoff-year Wikipedia paragraphs (train/qa/build_2012_qa.py) — keep to a few % of the mix
+    "qa_2012": (300_000_000, 900_000_000),
+    # contemporaneous 2012 news (Guardian API + Wikinews) — small but dense in cutoff-year facts
+    "news_2012": (100_000_000, 300_000_000),
 }
 TARGET_UNIQUE_TOKENS = (27_000_000_000, 38_000_000_000)
 
 # ---------------------------------------------------------------------------
 # 2012 weighting (Phase 5.2) — start conservative, raise if needed
 # ---------------------------------------------------------------------------
-QA_UPSAMPLE = 2
-QA_LOSS_WEIGHT = 2.5  # start 2–3×; climb toward 4–5× only if stable
 DEFAULT_LOSS_WEIGHT = 1.0
+# Per-doc weight for natural prose dated in CUTOFF_YEAR (news_2012, usenet posts from 2012, qa_2012).
+# Mild on purpose: helps the validator's 5x cutoff-year known items without over-repeating text.
+CUTOFF_YEAR_DOC_WEIGHT = 1.5
+# qa_2012 paragraphs already appear inside wikipedia_2012 — mild weight, capped size;
+# passes are set by MIX_MAX_EPOCHS["qa_2012"]
+QA_LOSS_WEIGHT = CUTOFF_YEAR_DOC_WEIGHT
+QA_MAX_TOKENS = 600_000_000  # ≈1.5–2% of a 30–40B-token mix
 # FineWeb-edu classifier (HuggingFaceFW/fineweb-edu-classifier): keep int_score >= this
 # ChronoGPT / FineWeb-Edu-score-2 use threshold 2; official FineWeb-Edu default is 3.
 FINEWEB_EDU_THRESHOLD = 2.0
@@ -152,17 +160,54 @@ FINEWEB_EDU_CLASSIFIER = os.environ.get(
 FINEWEB_EDU_MAX_LENGTH = 512
 FINEWEB_EDU_BATCH_SIZE = int(os.environ.get("FINEWEB_EDU_BATCH_SIZE", "32"))
 # Sources skipped by the post-datagen edu pass (scored later via wiki → QA, or already edu)
-FINEWEB_EDU_SKIP_STEMS = frozenset({"qa_2012"})
+FINEWEB_EDU_SKIP_STEMS = frozenset({"qa_2012", "usenet", "news_2012"})
 
-# Epochs (Phase 5.3)
-EPOCHS_HIGH_CONFIDENCE = 3  # wikipedia + QA
-EPOCHS_WEB = 1  # fineweb / usenet
+# ---------------------------------------------------------------------------
+# Training mix (Phase 5.1 / 5.3) — train/data/mix.py
+#   MIX_SHARES      target share of OUTPUT tokens per source (renormalised over the
+#                   sources actually present)
+#   MIX_MAX_EPOCHS  max passes over a source's unique tokens; a source that hits its cap
+#                   gives its unused share to the uncapped sources (the plan report shows
+#                   where shares ended up — check it before training)
+#   Sources not listed here (e.g. "smoke") are included exactly once.
+# ---------------------------------------------------------------------------
+MIX_SHARES = {
+    "wikipedia_2012": 0.30,
+    "fineweb_edu": 0.20,
+    "pes2o": 0.15,
+    "books": 0.13,
+    "usenet": 0.12,
+    "qa_2012": 0.05,
+    "news_2012": 0.05,
+}
+MIX_MAX_EPOCHS = {
+    "wikipedia_2012": 6,  # knowledge-dense; known test depends on it
+    "fineweb_edu": 2,
+    "pes2o": 4,
+    "books": 3,
+    "usenet": 2,
+    "qa_2012": 2,  # already inside wikipedia_2012 — keep repeats low
+    "news_2012": 6,  # small but densest cutoff-year source
+}
+# Output size of the mix. Match train_clm --total-tokens so every source gets exactly
+# its planned passes (the trainer loops the file if it trains longer).
+MIX_TOTAL_TOKENS = 35_000_000_000
+# Long docs (books) are split at paragraph boundaries so one book doesn't fill
+# hundreds of consecutive training windows.
+MIX_MAX_DOC_CHARS = 32_000
+# Per-source shuffle buffer (chars of text held in RAM per source) — varies order between passes
+MIX_SHUFFLE_BUFFER_CHARS = 32_000_000
 
 # ---------------------------------------------------------------------------
 # Training loop (Phase 6)
 # ---------------------------------------------------------------------------
 CHECKPOINT_EVERY_TOKENS = 1_000_000_000
 CANARY_ALERT_RATE = 0.05  # above ~chance on post-2012 → audit data
+# Defaults suit multi-GPU A100/H100 (~80GB). Override on the CLI for fat cards:
+#   2× H200 (141GB):  --batch-size 10 --grad-accum 20 --num-workers 4  (~0.8M tok/step)
+#   1× B300 (288GB):  --batch-size 24 --grad-accum 16 --num-workers 8  (48 OOMs; 24≈87% VRAM)
+#   3× A100  (80GB):  --batch-size 4  --grad-accum 40 --num-workers 4
+# Keep tokens/step ≈ batch × 2048 × accum × n_gpu near 0.5–1M for a stable schedule.
 BATCH_SIZE = 4
 GRAD_ACCUM = 8
 LEARNING_RATE = 3e-4

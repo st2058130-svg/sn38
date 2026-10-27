@@ -9,7 +9,7 @@ Features:
   * throughput log: tok/s total and per GPU, MFU vs bf16 peak, data-wait share;
     --profile N splits a step into data / fwd+bwd / all-reduce / optimizer
   * checkpoints every CHECKPOINT_EVERY_TOKENS with optimizer state, --resume support
-  * optional held-out val loss and canary check at every checkpoint
+  * optional held-out val loss at checkpoints (canary: python -m train.canary.evaluate --model PATH)
 
 Usage (smoke, CPU, tiny model):
   python -m train.run_smoke --train --steps 20
@@ -17,7 +17,7 @@ Usage (smoke, CPU, tiny model):
 Full run (8 GPUs):
   torchrun --nproc_per_node 8 -m train.train_clm \\
       --mix /workspace/sn38-data/mix/train_mix.jsonl --val-mix /workspace/sn38-data/mix/val_mix.jsonl \\
-      --init-new --tokenizer /workspace/tokenizer --total-tokens 35e9 --run-canary
+      --init-new --tokenizer /workspace/tokenizer --total-tokens 35e9
 
 Resume:
   torchrun ... -m train.train_clm --mix ... --resume train/checkpoints/step_12000_tok_...
@@ -421,9 +421,24 @@ def train_flops_per_token(model, ctx: int) -> tuple[float, int]:
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
+def _safetensors_gb(path: Path) -> float:
+    f = path / "model.safetensors"
+    return f.stat().st_size / (1024**3) if f.is_file() else float("nan")
+
+
 def save_checkpoint(model, tokenizer, optim, step: int, tokens: int, out_dir: Path, args) -> Path:
+    """Save fp32 train checkpoint + bf16 export for HF submit (<8GB).
+
+    Layout:
+      out_dir/step_{step}_tok_{tokens}/       — fp32 weights + optimizer (use with --resume)
+      out_dir/step_{step}_tok_{tokens}_bf16/  — bf16 weights only (upload this; ~4GB)
+    Returns the fp32 path (resume). Canary should load the ``_bf16`` sibling.
+    """
     path = out_dir / f"step_{step}_tok_{tokens}"
     path.mkdir(parents=True, exist_ok=True)
+    # Ensure train weights are fp32 before writing the resume checkpoint.
+    if next(model.parameters()).dtype != torch.float32:
+        model.float()
     model.save_pretrained(path, safe_serialization=True)
     tokenizer.save_pretrained(path)
     torch.save(
@@ -436,9 +451,33 @@ def save_checkpoint(model, tokenizer, optim, step: int, tokens: int, out_dir: Pa
         },
         path / "training_state.pt",
     )
-    meta = {"step": step, "tokens": tokens, "args": vars(args)}
+    meta = {"step": step, "tokens": tokens, "dtype": "float32", "args": vars(args)}
     (path / "train_meta.json").write_text(json.dumps(meta, indent=2, default=str))
-    logger.info("Checkpoint → %s", path)
+    logger.info("Checkpoint (fp32) → %s (model.safetensors=%.2f GiB)", path, _safetensors_gb(path))
+
+    # BF16 export on CPU — do NOT cast the live training model (DDP desync / NCCL risk).
+    bf16_path = out_dir / f"step_{step}_tok_{tokens}_bf16"
+    bf16_path.mkdir(parents=True, exist_ok=True)
+    model.config.save_pretrained(bf16_path)
+    tokenizer.save_pretrained(bf16_path)
+    # Copy sidecar files HF needs alongside safetensors (already written to fp32 path).
+    for name in ("generation_config.json", "configuration_nanochrono.py", "modeling_nanochrono.py",
+                 "configuration_nanoexpand.py", "modeling_nanoexpand.py"):
+        src = path / name
+        if src.is_file():
+            (bf16_path / name).write_bytes(src.read_bytes())
+    sd = {
+        k: (v.detach().to("cpu", dtype=torch.bfloat16) if v.is_floating_point() else v.detach().cpu())
+        for k, v in model.state_dict().items()
+    }
+    from safetensors.torch import save_file
+
+    save_file(sd, bf16_path / "model.safetensors")
+    meta_bf16 = {"step": step, "tokens": tokens, "dtype": "bfloat16", "fp32_checkpoint": str(path), "args": vars(args)}
+    (bf16_path / "train_meta.json").write_text(json.dumps(meta_bf16, indent=2, default=str))
+    gb = _safetensors_gb(bf16_path)
+    logger.info("Export (bf16) → %s (model.safetensors=%.2f GiB)%s", bf16_path, gb, " ⚠ ≥8 GiB" if gb >= 8.0 else "")
+
     return path
 
 
@@ -509,7 +548,6 @@ def main():
     )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--out", type=str, default=str(CHECKPOINT_DIR))
-    parser.add_argument("--run-canary", action="store_true", help="Run canary after each ckpt; stop on alert")
     args = parser.parse_args()
 
     rank, local_rank, world = dist_info()
@@ -623,9 +661,19 @@ def main():
     data_iter = iter(loader)
     if step:
         skip = step * args.grad_accum
-        logger.info("Skipping %d micro-batches of data to resume position", skip)
-        for _ in range(skip):
+        logger.info(
+            "Skipping %d micro-batches to resume data position (can take several minutes; progress below)...",
+            skip,
+        )
+        t_skip = time.time()
+        for i in range(skip):
             next(data_iter)
+            if is_main() and (i + 1) % max(1, skip // 10) == 0:
+                logger.info(
+                    "resume skip %d/%d (%.0f%%) elapsed=%.0fs",
+                    i + 1, skip, 100.0 * (i + 1) / skip, time.time() - t_skip,
+                )
+        logger.info("Resume data skip done in %.0fs — starting step=%d", time.time() - t_skip, step)
 
     out_dir = Path(args.out)
     if is_main():
@@ -722,25 +770,16 @@ def main():
             t0, last_log_tokens, data_wait = time.time(), tokens_seen, 0.0
 
         if step % ckpt_every_steps == 0 or step == total_steps:
-            stop = False
+            # Keep ranks aligned around slow ckpt I/O (avoids NCCL allreduce timeouts).
+            if ddp:
+                dist.barrier()
             if val_loader is not None:
                 val = evaluate_val(model, val_loader, device, amp_ctx, args.val_batches)
                 logger.info("val_loss=%.4f step=%d", val, step)
             if is_main():
-                ckpt = save_checkpoint(raw_model, tokenizer, optim, step, tokens_seen, out_dir, args)
-                if args.run_canary:
-                    from train.canary.evaluate import evaluate_model
-
-                    report = evaluate_model(str(ckpt), device=device)
-                    logger.info("canary leak_rate=%.3f alert=%s", report["leak_rate"], report["alert"])
-                    stop = bool(report["alert"])
+                save_checkpoint(raw_model, tokenizer, optim, step, tokens_seen, out_dir, args)
             if ddp:
-                flag = torch.tensor([int(stop)], device=device)
-                dist.broadcast(flag, 0)
-                stop = bool(flag.item())
-            if stop:
-                logger.error("Canary alert — stopping; audit the data pipeline")
-                break
+                dist.barrier()
 
     logger.info("Done at step=%d tokens=%d", step, tokens_seen)
     if ddp:

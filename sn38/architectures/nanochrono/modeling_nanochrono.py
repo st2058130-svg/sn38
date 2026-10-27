@@ -147,7 +147,8 @@ class NanochronoAttention(nn.Module):
             k = k.repeat_interleave(r, 1)
             v = v.repeat_interleave(r, 1)
         y = self._attend(q, k, v, window, mask, past_len)
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        # flash/flex often return bf16; o_proj weights stay fp32 outside autocast (e.g. canary generate)
+        y = y.transpose(1, 2).contiguous().view(B, T, -1).to(dtype=x.dtype)
         return self.o_proj(y)
 
     def _attend(self, q, k, v, window, mask, past_len):

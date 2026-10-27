@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 from train.config import CUTOFF_YEAR
-
-# Years after cutoff that should not appear as past events
-_POST_YEARS = list(range(CUTOFF_YEAR + 1, 2027))
-_YEAR_RE = re.compile(r"\b(" + "|".join(str(y) for y in _POST_YEARS) + r")\b")
 
 # Window around a year mention; past-tense / event verbs → likely leakage
 _PAST_HINT = re.compile(
@@ -28,19 +25,29 @@ _SAFE_HINT = re.compile(
 )
 
 
-def find_post_cutoff_years(text: str) -> list[tuple[int, int, int]]:
+@lru_cache(maxsize=8)
+def _year_re(cutoff_year: int) -> re.Pattern[str]:
+    post = list(range(int(cutoff_year) + 1, 2027))
+    if not post:
+        return re.compile(r"(?!)")  # never matches
+    return re.compile(r"\b(" + "|".join(str(y) for y in post) + r")\b")
+
+
+def find_post_cutoff_years(text: str, cutoff_year: int | None = None) -> list[tuple[int, int, int]]:
     """Return list of (year, start, end) for post-cutoff year mentions."""
-    return [(int(m.group(1)), m.start(), m.end()) for m in _YEAR_RE.finditer(text or "")]
+    cy = CUTOFF_YEAR if cutoff_year is None else int(cutoff_year)
+    return [(int(m.group(1)), m.start(), m.end()) for m in _year_re(cy).finditer(text or "")]
 
 
-def is_past_event_leak(text: str, window: int = 40) -> bool:
+def is_past_event_leak(text: str, window: int = 40, cutoff_year: int | None = None) -> bool:
     """True if a post-cutoff year appears near past-tense event language.
 
     Speculative framing ('By 2020 we expect...') is treated as safe.
     """
     if not text:
         return False
-    for year, start, end in find_post_cutoff_years(text):
+    cy = CUTOFF_YEAR if cutoff_year is None else int(cutoff_year)
+    for year, start, end in find_post_cutoff_years(text, cutoff_year=cy):
         left = max(0, start - window)
         right = min(len(text), end + window)
         ctx = text[left:right]
@@ -48,16 +55,13 @@ def is_past_event_leak(text: str, window: int = 40) -> bool:
             continue
         if _PAST_HINT.search(ctx):
             return True
-        # Bare year with no safe framing in a factual sentence — discard-on-doubt
-        # for high-confidence sources you may relax this; default is strict.
-        if year >= CUTOFF_YEAR + 1:
-            # require past hint for discard; bare years alone are not enough
-            # (covers "ISO 2014 standard" style noise). Past-tense path above
-            # already caught real leaks.
+        # Bare year with no safe framing — past-tense path above catches real leaks;
+        # bare years alone (e.g. "ISO 2014") are not enough to discard.
+        if year >= cy + 1:
             continue
     return False
 
 
-def has_hard_year_leak(text: str) -> bool:
-    """Stricter variant: any post-cutoff year + past tense anywhere in doc head."""
-    return is_past_event_leak(text)
+def has_hard_year_leak(text: str, cutoff_year: int | None = None) -> bool:
+    """Stricter variant: any post-cutoff year + past tense near it."""
+    return is_past_event_leak(text, cutoff_year=cutoff_year)

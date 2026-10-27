@@ -75,12 +75,20 @@ def evaluate_model(model_path: str, max_new_tokens: int = 32, device: str | None
         device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.eval()
+    # Match training: flash/flex run in bf16; keep generate under autocast to avoid dtype clashes.
+    import contextlib
+
+    if str(device).startswith("cuda"):
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        amp = torch.autocast("cuda", dtype=amp_dtype)
+    else:
+        amp = contextlib.nullcontext()
 
     generations = {}
     for item in suite["items"]:
         prompt = item["prompt"]
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
+        with torch.no_grad(), amp:
             out = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,

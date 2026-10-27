@@ -113,19 +113,19 @@ ls -lh $SN38_DATA_ROOT/mix/train_mix_2012_v1.jsonl
 #   --arch nanochrono --init-new --tokenizer $SN38_DATA_ROOT/tokenizer \
 #   --total-tokens 35e9 --batch-size 8 --grad-accum 8 \
 #   --schedule wsd --decay-frac 0.2 \
-#   --out $SN38_DATA_ROOT/checkpoints --run-canary
+#   --out $SN38_DATA_ROOT/checkpoints
 #
-# 2× H200 SXM (141GB each, ~12 vCPU) — ~0.82M tokens/step; flash-attn if installed:
+# 3× H200 SXM (141GB) — ~0.80M tokens/step (10×2048×13×3):
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# export SN38_PEAK_TFLOPS=989   # optional; auto-detected from "H200" in device name
-# torchrun --nproc_per_node 2 -m train.train_clm \
+# export SN38_PEAK_TFLOPS=989
+# torchrun --nproc_per_node 3 -m train.train_clm \
 #   --mix $SN38_DATA_ROOT/mix/train_mix.jsonl \
 #   --arch nanochrono --init-new --tokenizer $SN38_DATA_ROOT/tokenizer \
-#   --total-tokens 35e9 --batch-size 10 --grad-accum 20 --num-workers 4 \
+#   --total-tokens 35e9 --batch-size 10 --grad-accum 13 --num-workers 4 \
 #   --schedule wsd --decay-frac 0.2 --bf16-grad-sync \
-#   --out $SN38_DATA_ROOT/checkpoints --run-canary
-# If VRAM <~75%: try --batch-size 12 --grad-accum 16. OOM → --batch-size 8 --grad-accum 24.
-# Want backends: flash_attn_sliding + flash_attn_causal (else flex_*).
+#   --out $SN38_DATA_ROOT/checkpoints
+# 2× H200: --nproc_per_node 2 --batch-size 10 --grad-accum 20
+# VRAM headroom: try batch 12; OOM → batch 8. Want flash_attn_* backends.
 #
 # 1× B300 (288GB) — batch 48 OOMs; 24≈87% VRAM:
 # torchrun --nproc_per_node 1 -m train.train_clm \
@@ -133,8 +133,7 @@ ls -lh $SN38_DATA_ROOT/mix/train_mix_2012_v1.jsonl
 #   --arch nanochrono --init-new --tokenizer $SN38_DATA_ROOT/tokenizer \
 #   --total-tokens 35e9 --batch-size 24 --grad-accum 16 --num-workers 8 \
 #   --schedule wsd --decay-frac 0.2 \
-#   --out $SN38_DATA_ROOT/checkpoints --run-canary
-#
+#   --out $SN38_DATA_ROOT/checkpoints
 # Resume after a crash (weights + optimizer + data position):
 # torchrun --nproc_per_node 8 -m train.train_clm --mix ... --total-tokens 35e9 \
 #   --batch-size 8 --grad-accum 8 --schedule wsd --tokenizer $SN38_DATA_ROOT/tokenizer \

@@ -1,0 +1,25 @@
+# ========== Strip FineWeb + books from mix, then year-leak audit (cutoff 2011) ==========
+cd /workspace/sn38
+export SN38_DATA_ROOT=/workspace/sn38-data
+export PYTHONPATH=/workspace/sn38${PYTHONPATH:+:$PYTHONPATH}
+
+# 1) Drop fineweb_edu + books → new mix (do NOT overwrite while training reads old mix)
+python -m train.data.strip_mix_sources \
+  --in $SN38_DATA_ROOT/mix/train_mix.jsonl \
+  --out $SN38_DATA_ROOT/mix/train_mix_nofineweb_nobooks.jsonl \
+  --drop fineweb_edu books
+
+# 2a) Quick sample audit (first 100k docs)
+python -m train.data.audit_mix_years \
+  --in $SN38_DATA_ROOT/mix/train_mix_nofineweb_nobooks.jsonl \
+  --cutoff-year 2011 \
+  --max-docs 100000
+
+# 2b) Full clean: drop rows with post-cutoff year + past-tense leak
+python -m train.data.audit_mix_years \
+  --in $SN38_DATA_ROOT/mix/train_mix_nofineweb_nobooks.jsonl \
+  --cutoff-year 2011 \
+  --out $SN38_DATA_ROOT/mix/train_mix_clean_2011.jsonl
+
+# 3) Train / continue on the clean mix:
+# torchrun ... --mix $SN38_DATA_ROOT/mix/train_mix_clean_2011.jsonl ...

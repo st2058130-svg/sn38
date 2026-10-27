@@ -204,7 +204,8 @@ MIX_SHUFFLE_BUFFER_CHARS = 32_000_000
 CHECKPOINT_EVERY_TOKENS = 1_000_000_000
 CANARY_ALERT_RATE = 0.05  # above ~chance on post-2012 → audit data
 # Defaults suit multi-GPU A100/H100 (~80GB). Override on the CLI for fat cards:
-#   2× H200 (141GB):  --batch-size 10 --grad-accum 20 --num-workers 4  (~0.8M tok/step)
+#   2× H200 (141GB):  --batch-size 10 --grad-accum 20 --num-workers 4  (~0.82M tok/step)
+#   3× H200 (141GB):  --batch-size 10 --grad-accum 13 --num-workers 4  (~0.80M tok/step)
 #   1× B300 (288GB):  --batch-size 24 --grad-accum 16 --num-workers 8  (48 OOMs; 24≈87% VRAM)
 #   3× A100  (80GB):  --batch-size 4  --grad-accum 40 --num-workers 4
 # Keep tokens/step ≈ batch × 2048 × accum × n_gpu near 0.5–1M for a stable schedule.

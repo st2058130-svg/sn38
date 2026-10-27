@@ -1,0 +1,38 @@
+# SN38 train / datagen Python deps (GPU pod).
+# Install torch WITH CUDA first, then this file:
+#
+#   pip install -U pip
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements.txt
+#   pip install -e .
+#
+# Optional flash-attn (H200/B300: build from source if no wheel):
+#   pip install ninja packaging
+#   FLASH_ATTENTION_FORCE_BUILD=TRUE TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=4 \
+#     pip install flash-attn --no-build-isolation
+#   # B300: TORCH_CUDA_ARCH_LIST="10.0"
+
+# --- core (train_clm / sn38 architectures) ---
+transformers>=4.48.0
+huggingface_hub>=0.25.0
+tokenizers>=0.21.0
+accelerate>=0.34.0
+safetensors>=0.4.0
+numpy>=1.26.0
+sentencepiece>=0.2.0
+protobuf>=4.0.0
+einops>=0.7.0
+hf-xet>=1.5.2
+
+# --- datagen / HF datasets ---
+datasets>=2.14.0
+requests>=2.0.0
+tiktoken>=0.5.0
+
+# --- build helpers (flash-attn compile) ---
+ninja
+packaging
+
+# --- tests / misc (pyproject) ---
+pytest>=8.0.0
+openai>=1.0.0

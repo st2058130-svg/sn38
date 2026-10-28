@@ -40,9 +40,10 @@ def find_post_cutoff_years(text: str, cutoff_year: int | None = None) -> list[tu
 
 
 def is_past_event_leak(text: str, window: int = 40, cutoff_year: int | None = None) -> bool:
-    """True if a post-cutoff year appears near past-tense event language.
+    """Soft: True if a post-cutoff year appears near past-tense event language.
 
     Speculative framing ('By 2020 we expect...') is treated as safe.
+    Bare years alone (e.g. 'ISO 2014') are kept.
     """
     if not text:
         return False
@@ -55,13 +56,43 @@ def is_past_event_leak(text: str, window: int = 40, cutoff_year: int | None = No
             continue
         if _PAST_HINT.search(ctx):
             return True
-        # Bare year with no safe framing — past-tense path above catches real leaks;
-        # bare years alone (e.g. "ISO 2014") are not enough to discard.
+        # Bare year with no safe framing — soft mode keeps these.
         if year >= cy + 1:
             continue
     return False
 
 
-def has_hard_year_leak(text: str, cutoff_year: int | None = None) -> bool:
-    """Stricter variant: any post-cutoff year + past tense near it."""
-    return is_past_event_leak(text, cutoff_year=cutoff_year)
+def has_hard_year_leak(text: str, window: int = 40, cutoff_year: int | None = None) -> bool:
+    """Hard: drop any post-cutoff year unless the window is *only* speculative.
+
+    Bare years (no safe framing) are leaks. Past-tense near the year is a leak.
+    'By 2020 we expect...' with no past hint is kept.
+    """
+    if not text:
+        return False
+    cy = CUTOFF_YEAR if cutoff_year is None else int(cutoff_year)
+    for _year, start, end in find_post_cutoff_years(text, cutoff_year=cy):
+        left = max(0, start - window)
+        right = min(len(text), end + window)
+        ctx = text[left:right]
+        if _SAFE_HINT.search(ctx) and not _PAST_HINT.search(ctx):
+            continue
+        return True
+    return False
+
+
+def has_any_post_cutoff_year(text: str, cutoff_year: int | None = None) -> bool:
+    """Strictest: any post-cutoff calendar year token → leak (no safe exceptions)."""
+    return bool(find_post_cutoff_years(text, cutoff_year=cutoff_year))
+
+
+def is_year_leak(text: str, mode: str = "soft", cutoff_year: int | None = None, window: int = 40) -> bool:
+    """Dispatch soft | hard | any."""
+    m = (mode or "soft").lower()
+    if m == "soft":
+        return is_past_event_leak(text, window=window, cutoff_year=cutoff_year)
+    if m == "hard":
+        return has_hard_year_leak(text, window=window, cutoff_year=cutoff_year)
+    if m == "any":
+        return has_any_post_cutoff_year(text, cutoff_year=cutoff_year)
+    raise ValueError(f"unknown year-leak mode {mode!r}; use soft|hard|any")

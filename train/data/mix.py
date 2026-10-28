@@ -230,8 +230,16 @@ def stream_source(
                 if not text:
                     continue
                 weight = float(doc.get("loss_weight", base_weight))
+                pub = doc.get("publication_date")
+                if not pub and isinstance(doc.get("metadata"), dict):
+                    pub = doc["metadata"].get("publication_date") or doc["metadata"].get("date")
+                if not pub and isinstance(doc.get("_filter"), dict):
+                    pub = doc["_filter"].get("best_date")
                 for piece in split_long(text, max_doc_chars):
-                    buf.append({"text": piece, "source": source, "loss_weight": weight, "year": doc.get("year")})
+                    rec = {"text": piece, "source": source, "loss_weight": weight, "year": doc.get("year")}
+                    if pub:
+                        rec["publication_date"] = pub
+                    buf.append(rec)
                     held += len(piece)
                 while held > buffer_chars and buf:
                     rec = buf.pop(rng.randrange(len(buf)))

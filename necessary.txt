@@ -1,25 +1,52 @@
-# ========== Strip FineWeb + books from mix, then year-leak audit (cutoff 2011) ==========
+# ========== Timestamped-only mix (ChronoGPT-style) — cutoff 2011 ==========
+# Requires real parseable dates ≤ 2011-12-31. No trusted-without-date.
+# Excludes FineWeb by default. Optional hard year text scan.
 cd /workspace/sn38
 export SN38_DATA_ROOT=/workspace/sn38-data
 export PYTHONPATH=/workspace/sn38${PYTHONPATH:+:$PYTHONPATH}
 
-# 1) Drop fineweb_edu + books → new mix (do NOT overwrite while training reads old mix)
-python -m train.data.strip_mix_sources \
-  --in $SN38_DATA_ROOT/mix/train_mix.jsonl \
-  --out $SN38_DATA_ROOT/mix/train_mix_nofineweb_nobooks.jsonl \
-  --drop fineweb_edu books
+# Prefer filtered/ (or filtered_edu/ if that is what you have).
+# Expected stems: wikipedia_2012 news_2012 usenet pes2o  (+ qa_2012 from qa/)
 
-# 2a) Quick sample audit (first 100k docs)
-python -m train.data.audit_mix_years \
-  --in $SN38_DATA_ROOT/mix/train_mix_nofineweb_nobooks.jsonl \
+# 1) Sample one source first (optional)
+python -m train.data.build_timestamped_mix \
+  --filtered-dir $SN38_DATA_ROOT/filtered \
   --cutoff-year 2011 \
-  --max-docs 100000
+  --year-mode hard \
+  --sources wikipedia_2012 \
+  --max-docs-per-source 100000 \
+  --out-dir $SN38_DATA_ROOT/filtered_timestamped_2011_sample \
+  --shards-only
 
-# 2b) Full clean: drop rows with post-cutoff year + past-tense leak
-python -m train.data.audit_mix_years \
-  --in $SN38_DATA_ROOT/mix/train_mix_nofineweb_nobooks.jsonl \
+# 2) Full: write timestamped shards + mix
+python -m train.data.build_timestamped_mix \
+  --filtered-dir $SN38_DATA_ROOT/filtered \
   --cutoff-year 2011 \
-  --out $SN38_DATA_ROOT/mix/train_mix_clean_2011.jsonl
+  --year-mode hard \
+  --out-dir $SN38_DATA_ROOT/filtered_timestamped_2011 \
+  --out-mix $SN38_DATA_ROOT/mix/train_mix_timestamped_2011.jsonl \
+  --total-tokens 20e9
 
-# 3) Train / continue on the clean mix:
-# torchrun ... --mix $SN38_DATA_ROOT/mix/train_mix_clean_2011.jsonl ...
+# Optional: include books (weaker dates)
+#   ... --include-books
+
+# 3) Train from scratch on timestamped mix (keep 3B ckpt; new out dir)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export SN38_PEAK_TFLOPS=989
+TOK=$SN38_DATA_ROOT/tokenizer
+# TOK=$SN38_DATA_ROOT/checkpoints/chrono-2011-a-3-FP32   # if tokenizer only lives there
+mkdir -p $SN38_DATA_ROOT/logs $SN38_DATA_ROOT/checkpoints/from_scratch_ts_2011
+
+torchrun --nproc_per_node 2 -m train.train_clm \
+  --mix $SN38_DATA_ROOT/mix/train_mix_timestamped_2011.jsonl \
+  --arch nanochrono --init-new --tokenizer "$TOK" \
+  --total-tokens 20e9 --batch-size 10 --grad-accum 20 --num-workers 4 \
+  --schedule wsd --decay-frac 0.2 --bf16-grad-sync \
+  --out $SN38_DATA_ROOT/checkpoints/from_scratch_ts_2011 \
+  2>&1 | tee $SN38_DATA_ROOT/logs/train_from_scratch_ts_2011.log
+
+# ========== Older: hard year filter on existing clean mix ==========
+# python -m train.data.audit_mix_years \
+#   --in $SN38_DATA_ROOT/mix/train_mix_clean_2011.jsonl \
+#   --cutoff-year 2011 --mode hard \
+#   --out $SN38_DATA_ROOT/mix/train_mix_hard_2011.jsonl

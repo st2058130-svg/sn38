@@ -3,6 +3,7 @@
 Features:
   * sequence packing (documents joined with EOS into full CONTEXT_LENGTH windows)
   * per-token loss weights carried from each mix row's ``loss_weight``
+  * optional --mask-post-cutoff-years: labels=-100 on post-cutoff year tokens
   * bf16 autocast, TF32, fused AdamW (no decay on norms/biases/embeddings)
   * warmup → cosine or WSD (warmup-stable-decay) LR schedule over --total-tokens
   * multi-GPU via torchrun (DDP), optional bf16 gradient all-reduce (--bf16-grad-sync)
@@ -79,6 +80,60 @@ def is_main() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Post-cutoff year loss masking (labels → -100; uses existing ignore_index path)
+# ---------------------------------------------------------------------------
+def build_post_cutoff_year_token_seqs(tokenizer, cutoff_year: int, end_year: int = 2026) -> list[list[int]]:
+    """Token-id sequences for calendar years (cutoff_year+1) … end_year.
+
+    Encodes both ``YYYY`` and `` YYYY`` so leading-space BPE pieces are covered.
+    """
+    seqs: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for y in range(int(cutoff_year) + 1, int(end_year) + 1):
+        for text in (str(y), f" {y}"):
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if not ids:
+                continue
+            key = tuple(ids)
+            if key not in seen:
+                seen.add(key)
+                seqs.append(list(ids))
+    # Longer sequences first so multi-token years match before shorter pieces
+    seqs.sort(key=len, reverse=True)
+    return seqs
+
+
+def mask_labels_for_post_cutoff_years(
+    ids: list[int],
+    labels: torch.Tensor,
+    year_seqs: list[list[int]],
+    window_after: int = 0,
+) -> torch.Tensor:
+    """Set labels to -100 where the predicted token is (or follows) a post-cutoff year.
+
+    ``labels[j]`` is the prediction target for ``ids[j+1]``. Masking year span
+    ``ids[s:e]`` clears ``labels[s-1 : e-1]`` (and optionally ``window_after`` more).
+    """
+    if not year_seqs or labels.numel() == 0:
+        return labels
+    out = labels.clone()
+    n = len(ids)
+    for needle in year_seqs:
+        m = len(needle)
+        if m == 0 or m > n:
+            continue
+        for s in range(0, n - m + 1):
+            if ids[s : s + m] != needle:
+                continue
+            # Predict ids[k] → labels index k-1
+            lo = max(0, s - 1)
+            hi = min(out.numel(), (s + m - 1) + max(0, int(window_after)))
+            if lo < hi:
+                out[lo:hi] = -100
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Data: packed, weighted, sharded stream
 # ---------------------------------------------------------------------------
 class PackedJsonlDataset(IterableDataset):
@@ -88,6 +143,10 @@ class PackedJsonlDataset(IterableDataset):
     buffer; full windows are emitted together with per-token loss weights
     (the document's ``loss_weight``). Rows are sharded across DDP ranks and
     DataLoader workers by line index. A shuffle buffer decorrelates windows.
+
+    If ``mask_cutoff_year`` is set, label positions that predict post-cutoff
+    calendar years (and optional ``mask_year_window`` tokens after) are set to
+    -100 so ``weighted_lm_loss`` ignores them.
     """
 
     def __init__(
@@ -100,6 +159,8 @@ class PackedJsonlDataset(IterableDataset):
         seed: int = SEED,
         shuffle_buffer: int = 2048,
         loop: bool = True,
+        mask_cutoff_year: int | None = None,
+        mask_year_window: int = 0,
     ):
         self.path = Path(path)
         self.tokenizer = tokenizer
@@ -109,6 +170,8 @@ class PackedJsonlDataset(IterableDataset):
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
         self.loop = loop
+        self.mask_cutoff_year = mask_cutoff_year
+        self.mask_year_window = max(0, int(mask_year_window))
         self.eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
         # SN38 leak probes are scored as [BOS] + prompt (sn38/template/leak.py, using
         # tokenizer.bos_token_id), so every document starts with BOS here too.
@@ -124,6 +187,16 @@ class PackedJsonlDataset(IterableDataset):
         # Rust batch encoder (much faster than per-doc tokenizer.encode on long docs)
         self._backend = getattr(tokenizer, "backend_tokenizer", None)
         self._encode_batch_size = int(os.environ.get("SN38_ENCODE_BATCH", "64"))
+        self._year_seqs: list[list[int]] = []
+        if mask_cutoff_year is not None:
+            self._year_seqs = build_post_cutoff_year_token_seqs(tokenizer, mask_cutoff_year)
+            logger.info(
+                "Year loss-mask on: cutoff=%d → mask years %d..2026 (%d token patterns, window_after=%d)",
+                mask_cutoff_year,
+                int(mask_cutoff_year) + 1,
+                len(self._year_seqs),
+                self.mask_year_window,
+            )
 
     def _rows(self, shard: int, n_shards: int):
         with open(self.path, encoding="utf-8") as f:
@@ -204,13 +277,17 @@ class PackedJsonlDataset(IterableDataset):
             if not self.loop:
                 return
 
-    @staticmethod
-    def _to_tensors(item):
+    def _to_tensors(self, item):
         ids, w = item
         ids_t = torch.tensor(ids, dtype=torch.long)
         w_t = torch.tensor(w, dtype=torch.float)
         # predict token t+1 from tokens <= t; the weight belongs to the target token
-        return {"input_ids": ids_t[:-1], "labels": ids_t[1:], "loss_weight": w_t[1:]}
+        labels = ids_t[1:].clone()
+        if self._year_seqs:
+            labels = mask_labels_for_post_cutoff_years(
+                ids, labels, self._year_seqs, window_after=self.mask_year_window
+            )
+        return {"input_ids": ids_t[:-1], "labels": labels, "loss_weight": w_t[1:]}
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +625,23 @@ def main():
     )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--out", type=str, default=str(CHECKPOINT_DIR))
+    parser.add_argument(
+        "--mask-post-cutoff-years",
+        action="store_true",
+        help="Set labels to -100 on post-cutoff calendar year tokens (and optional window after)",
+    )
+    parser.add_argument(
+        "--mask-cutoff-year",
+        type=int,
+        default=2011,
+        help="With --mask-post-cutoff-years: mask years (this+1)..2026 (default 2011 → mask 2012+)",
+    )
+    parser.add_argument(
+        "--mask-year-window",
+        type=int,
+        default=0,
+        help="Also mask this many label positions after each post-cutoff year span (default 0)",
+    )
     args = parser.parse_args()
 
     rank, local_rank, world = dist_info()
@@ -628,7 +722,17 @@ def main():
     if args.compile:
         model = torch.compile(model)
 
-    ds = PackedJsonlDataset(Path(args.mix), tokenizer, CONTEXT_LENGTH, rank=rank, world_size=world, seed=SEED)
+    mask_year = args.mask_cutoff_year if args.mask_post_cutoff_years else None
+    ds = PackedJsonlDataset(
+        Path(args.mix),
+        tokenizer,
+        CONTEXT_LENGTH,
+        rank=rank,
+        world_size=world,
+        seed=SEED,
+        mask_cutoff_year=mask_year,
+        mask_year_window=args.mask_year_window,
+    )
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -639,7 +743,16 @@ def main():
     )
     val_loader = None
     if args.val_mix:
-        val_ds = PackedJsonlDataset(Path(args.val_mix), tokenizer, CONTEXT_LENGTH, rank=rank, world_size=world, loop=False)
+        val_ds = PackedJsonlDataset(
+            Path(args.val_mix),
+            tokenizer,
+            CONTEXT_LENGTH,
+            rank=rank,
+            world_size=world,
+            loop=False,
+            mask_cutoff_year=mask_year,
+            mask_year_window=args.mask_year_window,
+        )
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=0)
 
     tokens_per_step = args.batch_size * CONTEXT_LENGTH * args.grad_accum * world

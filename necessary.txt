@@ -1,9 +1,27 @@
-# ========== Timestamped-only mix (ChronoGPT-style) — cutoff 2011 ==========
-# Requires real parseable dates ≤ 2011-12-31. No trusted-without-date.
-# Excludes FineWeb by default. Optional hard year text scan.
+# ========== Refilter existing MIX → timestamped-only rows (cutoff 2011) ==========
 cd /workspace/sn38
 export SN38_DATA_ROOT=/workspace/sn38-data
 export PYTHONPATH=/workspace/sn38${PYTHONPATH:+:$PYTHONPATH}
+
+# Sample audit (does mix rows even have publication_date / year?)
+python -m train.data.refilter_mix_timestamped \
+  --in $SN38_DATA_ROOT/mix/train_mix_timestamped_2011.jsonl \
+  --cutoff-year 2011 \
+  --year-mode hard \
+  --max-docs 200000
+
+# Full rewrite (new file; don't overwrite while training)
+python -m train.data.refilter_mix_timestamped \
+  --in $SN38_DATA_ROOT/mix/train_mix_timestamped_2011.jsonl \
+  --cutoff-year 2011 \
+  --year-mode hard \
+  --out $SN38_DATA_ROOT/mix/train_mix_timestamped_2011_strict.jsonl
+
+# If keep_rate ≈ 0% / date_field_rate ≈ 0%: dates were never in the mix — rebuild below.
+
+# ========== Timestamped-only mix from filtered/ shards (ChronoGPT-style) ==========
+# Requires real parseable dates ≤ 2011-12-31. No trusted-without-date.
+# Excludes FineWeb by default. Optional hard year text scan.
 
 # Prefer filtered/ (or filtered_edu/ if that is what you have).
 # Expected stems: wikipedia_2012 news_2012 usenet pes2o  (+ qa_2012 from qa/)

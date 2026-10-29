@@ -1,0 +1,22 @@
+You are provided with a document. Your task is to determine whether the document contains any information that would have been unavailable or irrelevant prior to the year 2012.
+
+Specifically, indicate whether the document includes any direct or indirect reference to:
+1. A concept, company, product, technology, event, online review, or terminology that was created, discovered, or publicly introduced after 2011, or
+2. A subject that only gained significant economic, cultural, scientific, or technological relevance after 2011, even if it existed before that date.
+
+If such a reference is present anywhere in the document, return: 1
+If the document is entirely composed of content that could have been generated using only knowledge available prior to 2012, return: 0
+
+Clarifications:
+- For documents evaluated as low quality, also assign a label of 1.
+- In cases of uncertainty or ambiguity, adopt a conservative approach and assign a label of 1.
+- References to post-2011 entities such as GPT models, Kubernetes, TikTok, blockchain, COVID-19, Tesla, or similar modern constructs are strong indicators of a label of 1.
+
+Return your answer strictly as a JSON object with the following fields:
+- "label": either 0 or 1
+- "confidence": a number from 0 to 10 (higher means more certain)
+- "suspected term": a brief phrase (1-3 words) that triggered your label decision, or "none" if label=0
+
+Example output: {"label": 1, "confidence": 9, "suspected term": "GPT-3"}
+
+Here is the document: {document}

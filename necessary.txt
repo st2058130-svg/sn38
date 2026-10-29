@@ -1,7 +1,47 @@
-# ========== Refilter existing MIX → timestamped-only rows (cutoff 2011) ==========
+# ========== Drop news (and optional pes2o) from strict timestamped mix ==========
 cd /workspace/sn38
 export SN38_DATA_ROOT=/workspace/sn38-data
 export PYTHONPATH=/workspace/sn38${PYTHONPATH:+:$PYTHONPATH}
+
+# see exact source field names
+python -m train.data.strip_mix_sources \
+  --in $SN38_DATA_ROOT/mix/train_mix_timestamped_2011_strict.jsonl \
+  --list-sources
+
+# remove news only (stem is usually news_2012)
+python -m train.data.strip_mix_sources \
+  --in $SN38_DATA_ROOT/mix/train_mix_timestamped_2011_strict.jsonl \
+  --out $SN38_DATA_ROOT/mix/train_mix_no_news_2011.jsonl \
+  --drop news_2012
+
+# wiki only
+# python -m train.data.strip_mix_sources \
+#   --in $SN38_DATA_ROOT/mix/train_mix_timestamped_2011_strict.jsonl \
+#   --out $SN38_DATA_ROOT/mix/train_mix_wiki_only_2011.jsonl \
+#   --drop news_2012 pes2o
+
+# ========== GPT content filter (text field only) — OpenAI ==========
+set -a; [ -f .env ] && . ./.env; set +a   # needs OPENAI_API_KEY
+# optional: export OPENAI_FILTER_MODEL=gpt-4.1
+
+# Sample first (API cost!)
+python -m train.data.gpt_content_filter \
+  --in $SN38_DATA_ROOT/mix/train_mix_timestamped_2011.jsonl \
+  --out $SN38_DATA_ROOT/mix/train_mix_gpt_clean_2011.jsonl \
+  --prompt-file GPT4.1_Filter_Prompt.txt \
+  --cutoff-year 2011 \
+  --max-docs 1000 \
+  --concurrency 8
+
+# Full run (very expensive on ~80GB — use --resume to continue)
+# python -m train.data.gpt_content_filter \
+#   --in $SN38_DATA_ROOT/mix/train_mix_timestamped_2011.jsonl \
+#   --out $SN38_DATA_ROOT/mix/train_mix_gpt_clean_2011.jsonl \
+#   --prompt-file GPT4.1_Filter_Prompt.txt \
+#   --cutoff-year 2011 \
+#   --concurrency 16 --resume
+
+# ========== Refilter existing MIX → timestamped-only rows (cutoff 2011) ==========
 
 # Sample audit (does mix rows even have publication_date / year?)
 python -m train.data.refilter_mix_timestamped \
